@@ -69,7 +69,7 @@ class NixlBaseConnectorScheduler:
         assert vllm_config.kv_transfer_config is not None
         self._kv_lease_duration: int = (
             vllm_config.kv_transfer_config.get_from_extra_config(
-                "kv_lease_duration", 30
+                "kv_lease_duration", 180
             )
         )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
