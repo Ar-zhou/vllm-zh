@@ -1,0 +1,3 @@
+mode,draft_rounds,draft_tokens,accepted_tokens,accepted_pos1,accepted_pos2,accepted_pos3,accepted_pos4,accepted_pos5,accepted_pos6,accepted_pos7,accepted_pos8,completed_requests,prompt_tokens,generation_tokens,request_errors
+pp4_prefill_tp4_decode,28120,224960,30594,13218,7662,4337,2416,1382,805,476,298,94,4523219,58740,3
+colocated_tp8,36178,289424,113613,28607,22262,17317,13643,10919,8671,6889,5305,240,8048924,149697,0
