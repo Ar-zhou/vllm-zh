@@ -740,7 +740,21 @@ class Scheduler(SchedulerInterface):
                     spec_token_ids = request.spec_token_ids
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                    # The PP V2 runner needs one query row for the sampled
+                    # token in addition to one row per draft token. In PP,
+                    # num_new_tokens can be clipped to the draft count after
+                    # an in-flight stage completes, so only verify drafts
+                    # that have a corresponding query row.
+                    if (
+                        self.use_pp
+                        and self.vllm_config.speculative_config is not None
+                        and self.vllm_config.speculative_config.method == "dspark"
+                    ):
+                        spec_token_ids = spec_token_ids[
+                            : max(0, num_new_tokens - self.num_sampled_tokens_per_step)
+                        ]
+                    if spec_token_ids:
+                        scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.

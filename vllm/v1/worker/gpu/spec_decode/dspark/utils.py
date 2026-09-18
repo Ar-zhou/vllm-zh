@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 import torch.nn as nn
 
 from vllm.config import ModelConfig, VllmConfig, replace
+from vllm.config.compilation import CUDAGraphMode, CompilationMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -51,8 +54,26 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         vllm_config.attention_config.backend,
     )
 
+    use_pp = get_pp_group().world_size > 1
+    draft_parallel_config = copy.copy(speculative_config.draft_parallel_config)
+    draft_parallel_config.data_parallel_rank = (
+        vllm_config.parallel_config.data_parallel_rank
+    )
+    draft_parallel_config.data_parallel_index = (
+        vllm_config.parallel_config.data_parallel_index
+    )
+    draft_compilation_config = vllm_config.compilation_config
+    if use_pp:
+        draft_compilation_config = replace(
+            draft_compilation_config,
+            mode=CompilationMode.NONE,
+            cudagraph_mode=CUDAGraphMode.NONE,
+        )
+
     draft_vllm_config = replace(
         vllm_config,
+        parallel_config=draft_parallel_config,
+        compilation_config=draft_compilation_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
@@ -76,8 +97,22 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
-    if get_pp_group().world_size != 1:
-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
+    if use_pp:
+        for module in draft_model.modules():
+            if hasattr(module, "do_not_compile"):
+                module.do_not_compile = True
+        target_forward_context = (
+            vllm_config.compilation_config.static_forward_context
+        )
+        for layer_name, layer in (
+            draft_vllm_config.compilation_config.static_forward_context.items()
+        ):
+            existing = target_forward_context.get(layer_name)
+            if existing is not None and existing is not layer:
+                raise ValueError(
+                    f"Duplicate target/draft attention layer: {layer_name}"
+                )
+            target_forward_context[layer_name] = layer
 
     target_language_model = (
         target_model.get_language_model()
@@ -91,7 +126,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_embed = getattr(target_inner, "embed_tokens", None)
     draft_embed = getattr(draft_inner, "embed_tokens", None)
     if (
-        target_embed is not None
+        not use_pp
+        and target_embed is not None
         and draft_model_config.get_vocab_size() <= target_vocab_size
         and _should_share(
             draft_model, "has_own_embed_tokens", draft_embed, target_embed
@@ -108,7 +144,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         or draft_model_config.get_vocab_size()
     )
     if (
-        target_lm_head is not None
+        not use_pp
+        and target_lm_head is not None
         and draft_output_vocab_size == target_vocab_size
         and _should_share(draft_model, "has_own_lm_head", draft_lm_head, target_lm_head)
     ):

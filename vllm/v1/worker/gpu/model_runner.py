@@ -268,7 +268,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ):
                 # Drafting may require auxiliary hidden states from target model outputs
                 self.use_aux_hidden_state_outputs = True
-                if self.use_pp:
+                if self.use_pp and self.speculative_config.method != "dspark":
                     raise ValueError(
                         f"{self.speculative_config.method} with pipeline parallel "
                         "is not supported."
@@ -1002,10 +1002,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.encoder_cache.free_encoder_cache(mm_hash)
 
     def update_pp_decode_requests(self):
-        # For non-last PP ranks, update decode requests with sampler output from
-        # the prior step in which they were scheduled (pp_size steps ago).
+        # Update non-last PP ranks with the sampled output from the appropriate
+        # pipeline wave. Synchronous PP+DSpark needs the latest completed wave.
         if self.pp_handler is not None:
-            outputs = self.pp_handler.get_prev_sampled_outputs()
+            outputs = self.pp_handler.get_prev_sampled_outputs(
+                self.req_states.draft_tokens,
+                immediate=(
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "dspark"
+                    and not self.vllm_config.scheduler_config.async_scheduling
+                ),
+            )
             if outputs is not None:
                 self.postprocess_sampled(**outputs)
 
@@ -1206,7 +1213,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # combine_sampled_and_draft_tokens places a request's logits rows
             # at [query_end - num_logits, query_end). Fewer query rows than
             # that would silently select the preceding request's hidden states.
-            assert (num_scheduled_tokens_np >= num_logits).all()
+            assert (num_scheduled_tokens_np >= num_logits).all(), (
+                f"PP DSpark logits exceed scheduled tokens: req_ids={req_ids}, "
+                f"scheduled={num_scheduled_tokens_np.tolist()}, "
+                f"draft_lengths={num_draft_tokens_per_req.tolist()}, "
+                f"bonus={num_bonus_tokens}, logits={num_logits.tolist()}, "
+                f"scheduled_drafts={draft_tokens}"
+            )
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
@@ -1928,6 +1941,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            if self.pp_handler is not None:
+                self.main_stream.wait_stream(self.pp_handler.broadcast_stream)
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
             # target returns a persistent buffer sized at max_num_batched_tokens;
@@ -1953,6 +1968,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     mm_inputs=mm_inputs,
                 )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+            if self.pp_handler is not None:
+                self.pp_handler.broadcast_drafts(
+                    self.req_states.draft_tokens, input_batch
+                )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch

@@ -270,14 +270,28 @@ class DeepseekV32Model(torch.nn.Module):
             assert residual is None, "Currently, SP is not supported with PP"
 
         aux_hidden_states = []
+        use_pp_aux = get_pp_group().world_size > 1 and bool(
+            self.aux_hidden_state_layers
+        )
+        aux_slot_of = {
+            layer_id: i
+            for i, layer_id in enumerate(sorted(self.aux_hidden_state_layers))
+        }
+        aux_slots: list[torch.Tensor | None] = [None] * len(aux_slot_of)
+        if use_pp_aux and not get_pp_group().is_first_rank:
+            assert intermediate_tensors is not None
+            for i in range(len(aux_slots)):
+                aux_slots[i] = intermediate_tensors[f"aux_{i}"]
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(
-                    hidden_states if residual is None else hidden_states + residual
-                )
+            if idx in aux_slot_of:
+                aux = hidden_states if residual is None else hidden_states + residual
+                if use_pp_aux:
+                    aux_slots[aux_slot_of[idx]] = aux
+                else:
+                    aux_hidden_states.append(aux)
             hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
             attn_in = None
 
@@ -285,9 +299,22 @@ class DeepseekV32Model(torch.nn.Module):
             assert not self.use_sequence_parallel, (
                 "Currently, SP is not supported with PP"
             )
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            out = {"hidden_states": hidden_states, "residual": residual}
+            if use_pp_aux:
+                zero: torch.Tensor | None = None
+                for i, aux in enumerate(aux_slots):
+                    if aux is None:
+                        if zero is None:
+                            zero = torch.zeros_like(hidden_states)
+                        aux = zero
+                    out[f"aux_{i}"] = aux
+            return IntermediateTensors(out)
+
+        if use_pp_aux:
+            if self.end_layer in aux_slot_of:
+                aux_slots[aux_slot_of[self.end_layer]] = hidden_states + residual
+            assert all(aux is not None for aux in aux_slots)
+            aux_hidden_states = aux_slots
 
         if self.use_sequence_parallel:
             hidden_states, _ = self.norm(hidden_states, residual)
