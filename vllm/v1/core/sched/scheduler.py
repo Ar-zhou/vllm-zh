@@ -2343,6 +2343,18 @@ class Scheduler(SchedulerInterface):
                 # The request may have been finished. Skip.
                 continue
 
+            # XGrammar's structural-tag mask and DSpark's multi-token output
+            # can disagree on the GLM <tool_call> special token. Verify these
+            # requests one target token at a time until the grammar/speculative
+            # interaction is resolved; normal requests still use DSpark.
+            if (
+                request.use_structured_output
+                and self.vllm_config.speculative_config is not None
+                and self.vllm_config.speculative_config.method == "dspark"
+            ):
+                request.spec_token_ids = []
+                continue
+
             if request.is_prefill_chunk:
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:

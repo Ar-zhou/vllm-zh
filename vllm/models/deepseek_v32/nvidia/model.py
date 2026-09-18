@@ -34,7 +34,6 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     get_pp_missing_layer_names,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
@@ -188,6 +187,10 @@ class DeepseekV32Model(torch.nn.Module):
             dtype=torch.int32,
             device=self.device,
         )
+        # Sparse MLA reuses the last indexer's top-k result across several
+        # layers. A PP boundary can fall inside that reuse window, so the next
+        # stage needs the same top-k rows as the previous stage.
+        self.topk_indices_buffer = topk_indices_buffer
 
         if get_pp_group().is_first_rank:
             self.embed_tokens = make_input_embedding(
@@ -216,12 +219,28 @@ class DeepseekV32Model(torch.nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
+        self.make_empty_intermediate_tensors = self._make_pp_intermediate_tensors
 
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+
+    def _make_pp_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        keys = ["hidden_states", "residual"] + [
+            f"aux_{i}" for i in range(len(self.aux_hidden_state_layers))
+        ]
+        tensors = {
+            key: torch.zeros(
+                (batch_size, self.config.hidden_size), dtype=dtype, device=device
+            )
+            for key in keys
+        }
+        if get_pp_group().world_size > 1:
+            tensors["topk_indices"] = torch.empty(
+                (batch_size, self.config.index_topk), dtype=torch.int32, device=device
+            )
+        return IntermediateTensors(tensors)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -256,6 +275,13 @@ class DeepseekV32Model(torch.nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            # The first local layer may skip scoring and read the previous
+            # stage's top-k indices immediately. Stage-local buffers are not
+            # shared across devices, including under CUDA Graph replay.
+            if get_pp_group().world_size > 1:
+                self.topk_indices_buffer[: positions.shape[0]].copy_(
+                    intermediate_tensors["topk_indices"]
+                )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
@@ -299,7 +325,11 @@ class DeepseekV32Model(torch.nn.Module):
             assert not self.use_sequence_parallel, (
                 "Currently, SP is not supported with PP"
             )
-            out = {"hidden_states": hidden_states, "residual": residual}
+            out = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+                "topk_indices": self.topk_indices_buffer[:full_num_tokens],
+            }
             if use_pp_aux:
                 zero: torch.Tensor | None = None
                 for i, aux in enumerate(aux_slots):
@@ -451,6 +481,17 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         if self.config.model_type == "glm_moe_dsa":
             enable_glm52_low_latency_gemm(self, vllm_config.model_config.dtype)
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super().set_aux_hidden_state_layers(layers)
+        # The base setter replaces the PP intermediate-tensor factory. Keep
+        # both auxiliary hidden states and the sparse top-k handoff.
+        self.model.make_empty_intermediate_tensors = (
+            self.model._make_pp_intermediate_tensors
+        )
+        self.make_empty_intermediate_tensors = (
+            self.model._make_pp_intermediate_tensors
+        )
 
     def set_moe_parameters(self):
         # Same as the base, but keyed on the MoE block type rather than the
