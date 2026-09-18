@@ -46,3 +46,4 @@ The final eager peak is 77,251 MiB, versus 83,673 MiB on the old partition. Grap
 1. Diagnose the PP+DSpark CUDA Graph path; the balanced Graph run accepted only 1.711 draft tokens/round versus 2.039 in eager mode.
 2. If throughput matters, schedule one extra target query row to verify all eight DSpark proposals instead of trimming to seven.
 3. Investigate the intermittent target-only PP8 chat-output repetition separately from DSpark acceptance.
+4. Tool-call parsing needs separate work: an auto-tool request returned HTTP 200 but no structured `tool_calls` within 64 generated tokens; a forced `get_weather` choice returned HTTP 500 because xgrammar rejected GLM's `<tool_call>` token (154843). The launcher has the tool flags, but this smoke test does not establish functional tool calling.
