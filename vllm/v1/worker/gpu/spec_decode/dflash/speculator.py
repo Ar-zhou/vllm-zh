@@ -226,6 +226,18 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> torch.Tensor:
+        draft_input_ids = self.input_buffers.input_ids[:num_tokens]
+        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+            draft_vocab_size = self.model.model.embed_tokens.num_embeddings
+            invalid_ids = (draft_input_ids < 0) | (
+                draft_input_ids >= draft_vocab_size
+            )
+            draft_input_ids.masked_fill_(invalid_ids, 0)
+            draft_positions = self.input_buffers.positions[:num_tokens]
+            invalid_positions = (draft_positions < 0) | (
+                draft_positions >= self.max_model_len
+            )
+            draft_positions.masked_fill_(invalid_positions, 0)
         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
         with set_forward_context(
             attn_metadata,
@@ -237,7 +249,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             batch_descriptor=batch_descriptor,
         ):
             last_hidden_states = self.model(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
+                input_ids=draft_input_ids,
                 positions=self.input_buffers.positions[:num_tokens],
                 inputs_embeds=None,
             )
@@ -377,6 +389,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
         assert self.draft_kv_cache_group_id >= 0
+        if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+            self.input_buffers.input_ids.zero_()
+            self.input_buffers.positions.zero_()
         # Support multiple draft KV cache groups by preparing inputs once for each
         for i, gid in enumerate(self.draft_kv_cache_group_ids):
             prepare_dflash_inputs(

@@ -563,7 +563,7 @@ class NixlPushConnectorWorker(NixlBaseConnectorWorker):
                 remote_block_size,
                 req_id,
             )
-            if tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1):
+            if self._needs_split_local_xfer_handles(tp_ratio, plan):
                 # Multiple targets: write each rank its chunk of local memory.
                 # Hybrid MLA+SSM also lands here: its split handles replicate
                 # the attention descriptors and chunk only the SSM state.

@@ -172,6 +172,12 @@ class EngineCore:
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
+        self.defer_pp_dspark_drafts = (
+            vllm_config.parallel_config.pipeline_parallel_size > 1
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.method == "dspark"
+        )
+        self.pp_dspark_output_ready = False
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
         if self.scheduler.ec_connector is not None:  # type: ignore
@@ -630,10 +636,20 @@ class EngineCore:
         # When using async scheduling we can't get draft token ids in advance,
         # so we update draft token ids in the worker process and don't
         # need to update draft token ids here.
-        if self.check_for_draft_tokens and not self.async_scheduling and model_executed:
-            draft_token_ids = self.model_executor.take_draft_token_ids()
-            if draft_token_ids is not None:
-                self.scheduler.update_draft_token_ids(draft_token_ids)
+        if not self.check_for_draft_tokens or self.async_scheduling:
+            return
+        if self.defer_pp_dspark_drafts:
+            # PP can enqueue up to pp_size batches before their sampled outputs
+            # reach the scheduler. Publishing drafts earlier schedules them
+            # without the preceding sampled token (8 instead of 9 logits).
+            if not self.pp_dspark_output_ready:
+                return
+            self.pp_dspark_output_ready = False
+        elif not model_executed:
+            return
+        draft_token_ids = self.model_executor.take_draft_token_ids()
+        if draft_token_ids is not None:
+            self.scheduler.update_draft_token_ids(draft_token_ids)
 
     def step_with_batch_queue(
         self,
@@ -724,6 +740,10 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if self.defer_pp_dspark_drafts:
+            self.pp_dspark_output_ready = (
+                scheduler_output.total_num_scheduled_tokens > 0
+            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save

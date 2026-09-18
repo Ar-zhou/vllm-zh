@@ -199,6 +199,7 @@ class NixlBaseConnectorWorker:
         src_blocks_data: np.ndarray,
         num_fa_descs: int,
         block_size_ratio: int = 1,
+        mixed_attention_tp_size: int = 1,
     ) -> Iterator[list[tuple[int, int, int]]]:
         """Build split handle data for P_TP > D_TP scenario.
 
@@ -210,7 +211,9 @@ class NixlBaseConnectorWorker:
         fa_idx = next(
             i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
         )
-        fa_num_splits = len(plan.source_ranks_per_group[fa_idx])
+        fa_num_splits = max(
+            len(plan.source_ranks_per_group[fa_idx]), mixed_attention_tp_size
+        )
 
         has_ssm_descs = num_fa_descs < len(src_blocks_data)
         ssm_idx = next(
@@ -236,8 +239,17 @@ class NixlBaseConnectorWorker:
         )
         src_blocks_list = src_blocks_data.tolist()
 
-        for p_idx, p_rank in enumerate(plan.all_source_ranks):
-            fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
+        split_ranks = (
+            range(mixed_attention_tp_size)
+            if mixed_attention_tp_size > 1
+            else plan.all_source_ranks
+        )
+        for p_idx, p_rank in enumerate(split_ranks):
+            fa_slot = (
+                p_idx
+                if mixed_attention_tp_size > 1
+                else plan.rank_to_attention_slot.get(p_rank, 0)
+            )
 
             handle: list[tuple[int, int, int]] = []
             for j, (addr, local_len, dev) in enumerate(src_blocks_list):
@@ -265,7 +277,11 @@ class NixlBaseConnectorWorker:
         splitting the local region. Hybrid MLA+SSM is different: its mapping
         contains multiple source ranks for the sharded SSM state.
         """
-        return tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1)
+        return tp_ratio < 0 and (
+            not self.use_mla
+            or len(plan.all_source_ranks) > 1
+            or any(not mla for mla in self._region_is_mla)
+        )
 
     def _fa_desc_replicated(self, num_fa_descs: int) -> list[bool]:
         """Per-FA-descriptor replicate flag, in _build_fa_local emission order
@@ -1139,6 +1155,7 @@ class NixlBaseConnectorWorker:
         caches_data = []
         seen_storage_addresses: set[int] = set()
         seen_base_addresses: list[int] = []
+        self._registered_region_names: list[str] = []
         self._ssm_region_indices = []
         self._scratch_region_indices = []
         self._ple_region_index = None
@@ -1255,13 +1272,20 @@ class NixlBaseConnectorWorker:
                         for segment_idx in range(num_segments)
                     ]
 
-            for base_addr, block_len, block_stride in region_specs:
+            for segment_idx, (base_addr, block_len, block_stride) in enumerate(
+                region_specs
+            ):
                 if base_addr in seen_base_addresses:
                     region_index = seen_base_addresses.index(base_addr)
                     self._region_is_mla[region_index] |= is_mla_region
                 else:
                     region_index = len(seen_base_addresses)
                     seen_base_addresses.append(base_addr)
+                    self._registered_region_names.append(
+                        layer_name
+                        if len(region_specs) == 1
+                        else f"{layer_name}#{segment_idx}"
+                    )
                     self.block_len_per_layer.append(block_len)
                     self.block_stride_per_layer.append(block_stride)
                     self._region_is_mla.append(is_mla_region)
@@ -1306,6 +1330,7 @@ class NixlBaseConnectorWorker:
             == len(seen_base_addresses)
             == len(self._region_is_mla)
             == len(self.block_stride_per_layer)
+            == len(self._registered_region_names)
         )
         # Descriptor ids must be region-ordered, matching the remote side.
         self._scratch_region_indices.sort()
@@ -1318,9 +1343,17 @@ class NixlBaseConnectorWorker:
                 self.vllm_config.parallel_config
             )
             num_local_layers = end_layer - start_layer
-            assert num_local_layers > 0 and self.num_regions % num_local_layers == 0
-            regions_per_layer = self.num_regions // num_local_layers
-            self._remote_region_offset = regions_per_layer * start_layer
+            assert num_local_layers > 0
+            if self.num_regions % num_local_layers == 0:
+                regions_per_layer = self.num_regions // num_local_layers
+                self._remote_region_offset = regions_per_layer * start_layer
+            else:
+                logger.info(
+                    "Non-uniform PP KV regions on layers [%d,%d): %s",
+                    start_layer,
+                    end_layer,
+                    self._registered_region_names,
+                )
 
         # Total local FA descriptors (boundary between FA and mamba descs).
         self.num_descs = self.num_regions * self.num_blocks
@@ -1373,6 +1406,7 @@ class NixlBaseConnectorWorker:
             ),
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
+            layer_names=self._registered_region_names,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1562,6 +1596,14 @@ class NixlBaseConnectorWorker:
         # SPLIT regions read their head slice from this many remote ranks at a
         # per-rank offset; REPLICATE regions read the whole block once.
         split_reads = len(plan.source_ranks_per_group[fa_group_idx])
+        # A PP stage may contain both the target MLA cache and a head-sharded
+        # dSpark draft cache. The model-level MLA mapping has one source rank,
+        # but the draft region still needs one slice per remote TP rank.
+        if self.use_mla and any(not mla for mla in self._region_is_mla):
+            remote_tp_size = self.transfer_topo.get_engine_info(
+                nixl_agent_meta.engine_id
+            ).remote_tp_size
+            split_reads = max(split_reads, remote_tp_size // self.transfer_topo.tp_size)
         num_blocks = nixl_agent_meta.num_blocks
         device_id = nixl_agent_meta.device_id
         block_arange = np.arange(num_blocks, dtype=np.uint64)
@@ -1698,17 +1740,43 @@ class NixlBaseConnectorWorker:
             self.pp_size > 1
             and len(nixl_agent_meta.kv_caches_base_addr) > num_local_regions
         ):
-            # This worker holds a PP layer-slice; the PP=1 remote registered
-            # the full model. Slice its regions to our layer window so the
-            # logic below sees congruent local/remote lists.
-            start = self._remote_region_offset
-            end = start + num_local_regions
-            assert len(nixl_agent_meta.kv_caches_base_addr) >= end
-            nixl_agent_meta.kv_caches_base_addr = nixl_agent_meta.kv_caches_base_addr[
-                start:end
-            ]
-            nixl_agent_meta.block_lens = nixl_agent_meta.block_lens[start:end]
-            nixl_agent_meta.block_strides = nixl_agent_meta.block_strides[start:end]
+            # GLM indexer and dSpark add non-uniform KV regions. Resolve the
+            # exact PP slice by name rather than by an arithmetic layer offset.
+            if nixl_agent_meta.layer_names and self._registered_region_names:
+                remote_by_name = {
+                    name: i for i, name in enumerate(nixl_agent_meta.layer_names)
+                }
+                try:
+                    indices = [
+                        remote_by_name[name]
+                        for name in self._registered_region_names
+                    ]
+                except KeyError as error:
+                    raise RuntimeError(
+                        "Remote NIXL metadata is missing PP KV region "
+                        f"{error.args[0]!r}"
+                    ) from error
+                nixl_agent_meta.kv_caches_base_addr = [
+                    nixl_agent_meta.kv_caches_base_addr[i] for i in indices
+                ]
+                nixl_agent_meta.block_lens = [
+                    nixl_agent_meta.block_lens[i] for i in indices
+                ]
+                nixl_agent_meta.block_strides = [
+                    nixl_agent_meta.block_strides[i] for i in indices
+                ]
+                nixl_agent_meta.layer_names = [
+                    nixl_agent_meta.layer_names[i] for i in indices
+                ]
+            else:
+                start = self._remote_region_offset
+                end = start + num_local_regions
+                assert len(nixl_agent_meta.kv_caches_base_addr) >= end
+                nixl_agent_meta.kv_caches_base_addr = (
+                    nixl_agent_meta.kv_caches_base_addr[start:end]
+                )
+                nixl_agent_meta.block_lens = nixl_agent_meta.block_lens[start:end]
+                nixl_agent_meta.block_strides = nixl_agent_meta.block_strides[start:end]
 
         ### Register remote engine in TransferTopology (idempotent).
         assert self.transfer_topo is not None
@@ -1800,6 +1868,9 @@ class NixlBaseConnectorWorker:
                 src_blocks_data,
                 self.num_descs * block_size_ratio,
                 block_size_ratio,
+                remote_tp_size // transfer_topo.tp_size
+                if self.use_mla and any(not mla for mla in self._region_is_mla)
+                else 1,
             ):
                 descs = self.nixl_wrapper.get_xfer_descs(
                     handle_data, self.nixl_memory_type
@@ -1985,8 +2056,9 @@ class NixlBaseConnectorWorker:
             assert len(self.block_len_per_layer) == len(nixl_agent_meta.block_lens), (
                 "Number of KV layers must match between prefill and decode"
             )
-            model_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
-                remote_engine_id
+            model_replicated = (
+                not self.use_mla
+                and self.transfer_topo.is_kv_replicated(remote_engine_id)
             )
             total_kv_heads = self.transfer_topo.total_num_kv_heads
             local_heads = self.transfer_topo.local_physical_heads
@@ -1999,6 +2071,18 @@ class NixlBaseConnectorWorker:
                         "KV cache sizes must match between P and D when "
                         f"replicated (region {i}: local={local_len}, "
                         f"remote={remote_len}, bsr={block_size_ratio})."
+                    )
+                elif self.use_mla:
+                    # The MLA topology reports one KV head for the target, but
+                    # a mixed full-attention draft cache is TP-sharded.
+                    assert block_size_ratio == 1
+                    assert (
+                        local_len * self.transfer_topo.tp_size
+                        == remote_len * remote_tp_size
+                    ), (
+                        f"SPLIT draft region {i}: local={local_len}, "
+                        f"remote={remote_len}, local TP={self.transfer_topo.tp_size}, "
+                        f"remote TP={remote_tp_size}."
                     )
                 elif tp_ratio > 0:
                     assert (

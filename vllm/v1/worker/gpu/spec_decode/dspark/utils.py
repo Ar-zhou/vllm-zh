@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+
 import torch.nn as nn
 
 from vllm.config import ModelConfig, VllmConfig, replace
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.config.compilation import CUDAGraphMode, CompilationMode
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
@@ -51,21 +53,44 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         vllm_config.attention_config.backend,
     )
 
+    use_pp = vllm_config.parallel_config.pipeline_parallel_size > 1
+    draft_compilation_config = vllm_config.compilation_config
+    if use_pp:
+        draft_compilation_config = replace(
+            draft_compilation_config,
+            mode=CompilationMode.NONE,
+            cudagraph_mode=CUDAGraphMode.NONE,
+        )
+
+    draft_parallel_config = copy.copy(speculative_config.draft_parallel_config)
+    draft_parallel_config.data_parallel_rank = (
+        vllm_config.parallel_config.data_parallel_rank
+    )
+    draft_parallel_config.data_parallel_index = (
+        vllm_config.parallel_config.data_parallel_index
+    )
+
+    draft_cache_config = (
+        replace(
+            vllm_config.cache_config,
+            cache_dtype=speculative_config.kv_cache_dtype,
+        )
+        if speculative_config.kv_cache_dtype is not None
+        else vllm_config.cache_config
+    )
+    if use_pp and draft_cache_config.cache_dtype != "auto":
+        draft_cache_config = replace(draft_cache_config, cache_dtype="auto")
+
     draft_vllm_config = replace(
         vllm_config,
+        parallel_config=draft_parallel_config,
+        compilation_config=draft_compilation_config,
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
             backend=draft_attention_backend,
         ),
-        cache_config=(
-            replace(
-                vllm_config.cache_config,
-                cache_dtype=speculative_config.kv_cache_dtype,
-            )
-            if speculative_config.kv_cache_dtype is not None
-            else vllm_config.cache_config
-        ),
+        cache_config=draft_cache_config,
     )
     # VllmConfig post-init restores the target's quant config because the target
     # config is retained for DSpark's target-layer metadata, so we must override it.
@@ -76,8 +101,23 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
-    if get_pp_group().world_size != 1:
-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
+    if use_pp:
+        for module in draft_model.modules():
+            if hasattr(module, "do_not_compile"):
+                module.do_not_compile = True
+
+        target_forward_context = (
+            vllm_config.compilation_config.static_forward_context
+        )
+        for layer_name, layer in (
+            draft_vllm_config.compilation_config.static_forward_context.items()
+        ):
+            existing = target_forward_context.get(layer_name)
+            if existing is not None and existing is not layer:
+                raise ValueError(
+                    f"Duplicate target/draft attention layer: {layer_name}"
+                )
+            target_forward_context[layer_name] = layer
 
     target_language_model = (
         target_model.get_language_model()
@@ -90,16 +130,17 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     target_embed = getattr(target_inner, "embed_tokens", None)
     draft_embed = getattr(draft_inner, "embed_tokens", None)
-    if (
-        target_embed is not None
-        and draft_model_config.get_vocab_size() <= target_vocab_size
-        and _should_share(
-            draft_model, "has_own_embed_tokens", draft_embed, target_embed
-        )
-    ):
-        if draft_embed is not None:
-            del draft_inner.embed_tokens
-        draft_inner.embed_tokens = target_embed
+    if not use_pp:
+        if (
+            target_embed is not None
+            and draft_model_config.get_vocab_size() <= target_vocab_size
+            and _should_share(
+                draft_model, "has_own_embed_tokens", draft_embed, target_embed
+            )
+        ):
+            if draft_embed is not None:
+                del draft_inner.embed_tokens
+            draft_inner.embed_tokens = target_embed
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(draft_model, "lm_head", None)
@@ -107,13 +148,16 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         getattr(draft_model_config.hf_config, "draft_vocab_size", None)
         or draft_model_config.get_vocab_size()
     )
-    if (
-        target_lm_head is not None
-        and draft_output_vocab_size == target_vocab_size
-        and _should_share(draft_model, "has_own_lm_head", draft_lm_head, target_lm_head)
-    ):
-        if draft_lm_head is not None:
-            del draft_model.lm_head
-        draft_model.lm_head = target_lm_head
+    if not use_pp:
+        if (
+            target_lm_head is not None
+            and draft_output_vocab_size == target_vocab_size
+            and _should_share(
+                draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
+            )
+        ):
+            if draft_lm_head is not None:
+                del draft_model.lm_head
+            draft_model.lm_head = target_lm_head
 
     return draft_model

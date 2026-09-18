@@ -30,6 +30,7 @@ class PendingRecv:
     # Snapshot of slot generation counters at receive time, used to
     # detect requests aborted since then.
     gen_at_receive_np: np.ndarray  # [num_reqs]
+    draft_tokens: torch.Tensor | None = None
 
 
 def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
@@ -65,6 +66,7 @@ class PPHandler:
         self.is_last_rank = get_pp_group().is_last_rank
         self.last_rank = get_pp_group().last_rank
         self.max_sample_len = num_speculative_steps + 1
+        self.num_speculative_steps = num_speculative_steps
         self.device = device
         self.main_stream = torch.cuda.current_stream(device)
         self.broadcast_stream = torch.cuda.Stream(device)
@@ -87,10 +89,16 @@ class PPHandler:
             group_desc="pp_broadcast"
         )
 
+    def reset_after_warmup(self) -> None:
+        if not self.is_last_rank:
+            self.queue = deque([None] * get_pp_group().world_size)
+
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
 
-    def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
+    def get_prev_sampled_outputs(
+        self, draft_tokens_to_update: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor] | None:
         """Consume the entry from pp_size steps ago and wait for its recv event,
         then filter out entries whose request was freed since `receive`.
         """
@@ -116,6 +124,17 @@ class PPHandler:
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
         self.main_stream.wait_event(slot.event)
+        if slot.draft_tokens is not None and draft_tokens_to_update is not None:
+            draft_tokens = slot.draft_tokens
+            draft_idx_mapping = slot.idx_mapping
+            if exclude_mask.any():
+                keep = ~exclude_mask
+                keep_t = torch.as_tensor(keep, device=self.device)
+                draft_tokens = draft_tokens[keep_t]
+                draft_idx_mapping = async_copy_to_gpu(
+                    slot.idx_mapping_np[keep], device=self.device
+                )
+            draft_tokens_to_update[draft_idx_mapping] = draft_tokens
         return dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
@@ -149,12 +168,25 @@ class PPHandler:
             torch.distributed.broadcast(
                 combined, src=self.last_rank, group=self.broadcast_group
             )
+            draft_tokens = None
+            if self.num_speculative_steps > 0:
+                draft_tokens = torch.empty(
+                    num_reqs,
+                    self.num_speculative_steps,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(
+                    draft_tokens, src=self.last_rank, group=self.broadcast_group
+                )
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
             # Must record_stream since these were allocated on broadcast stream but
             # later used on the main stream.
             sampled_tokens.record_stream(self.main_stream)
             combined.record_stream(self.main_stream)
+            if draft_tokens is not None:
+                draft_tokens.record_stream(self.main_stream)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
@@ -164,8 +196,23 @@ class PPHandler:
             input_batch.idx_mapping_np,
             need_sampled_mask,
             gen_at_receive_np,
+            draft_tokens,
         )
         return bool(need_sampled_mask.all())
+
+    def broadcast_drafts(
+        self, draft_tokens: torch.Tensor, input_batch: InputBatch
+    ) -> None:
+        assert self.is_last_rank
+        if compute_need_sampled_mask(input_batch) is None:
+            return
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            send = draft_tokens[input_batch.idx_mapping].contiguous()
+            torch.distributed.broadcast(
+                send, src=self.last_rank, group=self.broadcast_group
+            )
+            send.record_stream(self.broadcast_stream)
 
     def broadcast(
         self,
@@ -186,8 +233,12 @@ class PPHandler:
 
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
+            send_tokens = torch.nn.functional.pad(
+                sampled_token_ids,
+                (0, self.max_sample_len - sampled_token_ids.shape[-1]),
+            ).contiguous()
             torch.distributed.broadcast(
-                sampled_token_ids.contiguous(),
+                send_tokens,
                 src=self.last_rank,
                 group=self.broadcast_group,
             )
@@ -197,3 +248,4 @@ class PPHandler:
             )
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)
+            send_tokens.record_stream(self.broadcast_stream)

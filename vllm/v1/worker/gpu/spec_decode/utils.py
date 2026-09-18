@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import deque
+
 import numpy as np
 import torch
 
@@ -12,44 +14,35 @@ class DraftTokensHandler:
     def __init__(self, device: torch.device | None = None):
         self.device = device
         self.copy_stream = torch.cuda.Stream(device)
-        # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
-        self.copy_event = torch.cuda.Event(blocking=True)
-
-        self.req_ids: list[str] = []
-        self.draft_tokens_np: np.ndarray | None = None
-        self.num_draft_tokens: int = 0
+        # PP can have several batches in flight. Keep each batch's drafts until
+        # its sampled output is processed by the engine core.
+        self.pending: deque[
+            tuple[list[str], np.ndarray, torch.cuda.Event]
+        ] = deque()
 
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
     ) -> None:
-        self.req_ids = input_batch.req_ids
-        self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
-            # No draft token validation needs to be performed by
-            # the scheduler for this batch.
-            self.draft_tokens_np = None
-            return
-
-        # For spec decoding + structured outputs, we must transfer the
-        # draft tokens back to the scheduler for grammar validation.
+        # Synchronous scheduling also consumes these ids in EngineCore.post_step.
+        # A placeholder can corrupt the next speculative batch under PP.
         current_stream = torch.cuda.current_stream(self.device)
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):
-            self.draft_tokens_np = async_copy_to_np(draft_tokens)
+            draft_tokens_np = async_copy_to_np(draft_tokens)
             # draft_tokens is a temporary allocation on the main stream and read here on
             # copy_stream; without record_stream, the caching allocator may reuse its
             # memory before the async copy executes.
             draft_tokens.record_stream(self.copy_stream)
-            self.copy_event.record()
+            copy_event = torch.cuda.Event(blocking=True)
+            copy_event.record()
+        self.pending.append((list(input_batch.req_ids), draft_tokens_np, copy_event))
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
-        if self.draft_tokens_np is not None:
-            self.copy_event.synchronize()
-            draft_token_ids = self.draft_tokens_np.tolist()
-        else:
-            # This case only happens when async scheduling is disabled.
-            draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
-        return DraftTokenIds(self.req_ids, draft_token_ids)
+        if not self.pending:
+            return None
+        req_ids, draft_tokens_np, copy_event = self.pending.popleft()
+        copy_event.synchronize()
+        return DraftTokenIds(req_ids, draft_tokens_np.tolist())
 
 
 def get_parallel_drafting_token_id(hf_config) -> int:
