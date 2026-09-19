@@ -74,3 +74,20 @@ Same 12-request × 256-token benchmark, PP8, seven proposals/round, adaptive ver
 The Graph run improves accepted draft tokens/round by 44% over the earlier Graph result and also beats patched eager. Its GPU 0–7 memory usage was 71,219, 73,077, 67,017, 73,057, 73,077, 73,073, 67,179, 74,937 MiB (7,920 MiB spread). The launch script now uses `FULL_DECODE_ONLY` CUDA Graph, with a ~74.9 GiB peak. Auto `get_weather` returned a structured `{"city":"Beijing"}` call. Native TP8's 2.055 accepted draft tokens/round is not a direct throughput comparison: PP8 still took 235 s versus TP8's 15.78 s on this small benchmark, and verifies one fewer proposal per round.
 
 This fix does not by itself resolve forced/named tool choice. With strict tool calling, xgrammar returned HTTP 500 on the `<tool_call>` token; disabling strict mode avoided HTTP 500 but produced plain content instead of a structured tool call, so that is not a valid workaround. A request-scoped compatibility guard now discards DSpark drafts for structured-output requests, forcing one-token target verification under the grammar while leaving ordinary requests speculative. With `VLLM_ENFORCE_STRICT_TOOL_CALLING=True`, both auto and forced `get_weather` returned HTTP 200 with structured `{"city":"Beijing"}` arguments; a normal France-capital chat returned `Paris`. The 12×256 Graph acceptance benchmark above predates this guard, but its ordinary, non-structured requests do not enter that code path. The eighth draft and PP8 throughput remain open work.
+
+## 2026-09-19: PP8 latency tuning
+
+The final stable service remains synchronous (`--no-async-scheduling`). Enabling async scheduling consistently caused a device-side index assertion on PP7 in the sparse-attention path. `CUDA_LAUNCH_BLOCKING=1` masked the race and improved observed TPOT, but is a diagnostic setting rather than a production fix. Trials that cloned the PP top-k handoff, isolated target/draft top-k scratch buffers, changed request-finish ordering, or limited the async in-flight queue to eight batches did not make the non-blocking configuration stable; all trial source changes were reverted.
+
+The retained tuning changes only `--max-num-batched-tokens` from 8192 to 16384. KV cache stays at 30G, `max-num-seqs` stays at 32, the balanced `13,11,10,11,11,11,8,3` partition is unchanged, and adaptive verification remains disabled.
+
+Steady-state 16-request benchmark with unique prompts, about 4,354 input tokens and 128 output tokens per request:
+
+| Prefill budget | Mean TTFT | Mean TPOT | Output throughput |
+|---:|---:|---:|---:|
+| 8192 | 19.59 s | 226.6 ms | 38.30 token/s |
+| 16384 | 19.77 s | 197.0 ms | 41.47 token/s |
+
+The 16384 configuration reduced TPOT by about 13% and increased output throughput by about 8%, while TTFT remained within 1%. An approximately 8,706-input-token run measured 38.42 s TTFT and 271.4 ms TPOT. After sustained tests, memory usage was 82,439, 85,683, 79,301, 86,173, 85,683, 85,485, 79,675, and 89,503 MiB on GPU 0–7 (10,202 MiB spread). Two consecutive slot-reuse tests completed and the service remained healthy. Named and auto tool calls both returned structured arguments successfully.
+
+Evidence is under `/mnt/sfs_turbo/n30008093/glm52-dspark-v029-pp8/`: `perf-sync-base-comparable-unique.json`, `perf-sync-16384-comparable-warm-unique.json`, `perf-sync-16384-long-warm-unique.json`, `perf-sync-16384-stability-a.json`, `perf-sync-16384-stability-b.json`, `tool-named-16384.json`, and `tool-auto-16384.json`.
