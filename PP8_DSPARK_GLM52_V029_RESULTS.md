@@ -91,3 +91,61 @@ Steady-state 16-request benchmark with unique prompts, about 4,354 input tokens 
 The 16384 configuration reduced TPOT by about 13% and increased output throughput by about 8%, while TTFT remained within 1%. An approximately 8,706-input-token run measured 38.42 s TTFT and 271.4 ms TPOT. After sustained tests, memory usage was 82,439, 85,683, 79,301, 86,173, 85,683, 85,485, 79,675, and 89,503 MiB on GPU 0–7 (10,202 MiB spread). Two consecutive slot-reuse tests completed and the service remained healthy. Named and auto tool calls both returned structured arguments successfully.
 
 Evidence is under `/mnt/sfs_turbo/n30008093/glm52-dspark-v029-pp8/`: `perf-sync-base-comparable-unique.json`, `perf-sync-16384-comparable-warm-unique.json`, `perf-sync-16384-long-warm-unique.json`, `perf-sync-16384-stability-a.json`, `perf-sync-16384-stability-b.json`, `tool-named-16384.json`, and `tool-auto-16384.json`.
+
+## 2026-09-19: Async PP stability and performance fix
+
+The async PP crash was narrowed to incomplete NCCL P2P receive work becoming
+visible while PP7 was already consuming GPU index tensors.  In the default
+NCCL mode, `Work.wait()` establishes a CUDA-stream dependency but need not
+block the worker thread until the transfer is complete.  Async scheduling can
+therefore advance buffer reuse far enough to expose the race; the eventual
+failure appeared as an `ATen/native/cuda/IndexKernel.cu` out-of-bounds assert
+on PP7.  This explains why `CUDA_LAUNCH_BLOCKING=1` hid the failure without
+being a usable production fix.
+
+The deployed fix enables `TORCH_NCCL_BLOCKING_WAIT=1` and removes
+`--no-async-scheduling`.  It blocks only on the relevant NCCL work handles,
+not on every CUDA kernel.  Attempts to use `torch.cuda.synchronize()` at every
+PP receive, or only at PP7, deadlocked CUDA Graph warmup because a device-wide
+barrier also waits for unrelated pipeline P2P work.  Those source experiments
+were reverted; the repository source is clean and the fix is a launcher
+setting.
+
+The final settings retain all earlier requirements:
+
+- PP partition `13,11,10,11,11,11,8,3`.
+- `--max-num-batched-tokens 16384`, 30G BF16 KV budget, and
+  `FULL_DECODE_ONLY` CUDA Graphs.
+- Eight DSpark proposals and `enable_adaptive_verification=false`.
+- `--enable-auto-tool-choice --tool-call-parser glm47` and strict tool calling.
+
+All latency tests used 16 concurrent requests with approximately 4,354 input
+tokens per request.  Unique runs used distinct request prefixes.
+
+| Async blocking-wait workload | Output tokens/request | Mean TTFT | Mean TPOT | TPOT p95 | Output throughput |
+|---|---:|---:|---:|---:|---:|
+| Shared prefix | 128 | 7.63 s | 21.0 ms | 28.8 ms | 197.9 token/s |
+| Unique prefix | 128 | 10.87 s | 34.2 ms | 108.3 ms | 134.3 token/s |
+| Unique stress round 1 | 256 | 8.17 s | 25.0 ms | 51.6 ms | 279.0 token/s |
+| Unique stress round 2 | 256 | 8.16 s | 24.4 ms | 51.1 ms | 280.9 token/s |
+| Unique stress round 3 | 256 | 8.17 s | 24.8 ms | 51.1 ms | 281.0 token/s |
+| Unique long decode | 512 | 10.32 s | 23.8 ms | 40.8 ms | 317.7 token/s |
+
+Thus the unique-prompt TPOT is comfortably below the requested 90 ms and is
+about 83% lower than the earlier 197 ms synchronous result.  After the full
+test sequence, DSpark metrics reported 13,498 accepted of 22,880 proposed
+tokens (59.0%, 4.72 accepted draft tokens per round).  Five consecutive unique
+stress/long-decode runs completed without `IndexKernel`, device assert, or
+engine-death errors.  A forced `get_weather` request returned HTTP 200 with a
+structured `{"city":"北京"}` tool call.
+
+Peak GPU 0-7 memory during the 16-request, 512-output run was 80,133, 83,407,
+76,241, 84,027, 83,407, 82,297, 77,527, and 86,953 MiB.  The 10,712 MiB spread
+is 7.5% of each 143,771 MiB GPU, while the last rank still carries the draft
+model and output head.  No layer repartition was needed.
+
+Evidence is in the same run directory: `perf-async-blockingwait-shared.json`,
+`perf-async-blockingwait-unique.json`,
+`perf-async-blockingwait-stress-{1,2,3}.json`,
+`perf-async-blockingwait-memory.json`, and
+`memory-async-blockingwait-load.csv`.
