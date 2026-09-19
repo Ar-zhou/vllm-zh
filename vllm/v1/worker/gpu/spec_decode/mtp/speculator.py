@@ -24,9 +24,6 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             if spec_config is not None
             else None
         )
-        # Detect index_share_for_mtp_iteration. When True, the proposer
-        # toggles skip_topk so step 0 computes MTP's own indices and
-        # steps 1+ reuse them.
         self.share_mtp_topk_indices = (
             getattr(draft_hf_config, "index_share_for_mtp_iteration", False)
             and hasattr(draft_model.model, "set_skip_topk")
@@ -45,7 +42,10 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         # multi-token batch. Compact them down to each request's last token so
         # steps 1+ can reuse them from the shared buffer.
         if self.share_mtp_topk_indices and self.num_speculative_steps > 1:
-            self.model.model.compact_topk_indices(self.last_token_indices[:num_reqs])
+            slot_ids = self.last_token_indices[:num_reqs].clamp(
+                min=0, max=self.max_num_tokens - 1
+            )
+            self.model.model.compact_topk_indices(slot_ids)
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None:
         # Switch to reuse mode so draft steps 1+ skip the indexer op and read

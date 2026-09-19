@@ -92,60 +92,25 @@ The 16384 configuration reduced TPOT by about 13% and increased output throughpu
 
 Evidence is under `/mnt/sfs_turbo/n30008093/glm52-dspark-v029-pp8/`: `perf-sync-base-comparable-unique.json`, `perf-sync-16384-comparable-warm-unique.json`, `perf-sync-16384-long-warm-unique.json`, `perf-sync-16384-stability-a.json`, `perf-sync-16384-stability-b.json`, `tool-named-16384.json`, and `tool-auto-16384.json`.
 
-## 2026-09-19: Async PP stability and performance fix
+## 2026-09-19: Async PP draft-broadcast race fix
 
-The async PP crash was narrowed to incomplete NCCL P2P receive work becoming
-visible while PP7 was already consuming GPU index tensors.  In the default
-NCCL mode, `Work.wait()` establishes a CUDA-stream dependency but need not
-block the worker thread until the transfer is complete.  Async scheduling can
-therefore advance buffer reuse far enough to expose the race; the eventual
-failure appeared as an `ATen/native/cuda/IndexKernel.cu` out-of-bounds assert
-on PP7.  This explains why `CUDA_LAUNCH_BLOCKING=1` hid the failure without
-being a usable production fix.
+The earlier conclusion that async scheduling was unusable was incomplete. A rolling 120-request workload reproduced the PP7 failure with both `max-num-seqs=32` and 16. The failing CUDA kernel was PyTorch's `vectorized_gather_kernel`; the exception surfaced later at PP communication because CUDA launches were asynchronous. Running the same workload with `CUDA_LAUNCH_BLOCKING=1` completed 120/120 requests, which isolated the problem as a stream-ordering race rather than invalid prompt data, KV exhaustion, or a fixed CUDA Graph batch shape.
 
-The deployed fix enables `TORCH_NCCL_BLOCKING_WAIT=1` and removes
-`--no-async-scheduling`.  It blocks only on the relevant NCCL work handles,
-not on every CUDA kernel.  Attempts to use `torch.cuda.synchronize()` at every
-PP receive, or only at PP7, deadlocked CUDA Graph warmup because a device-wide
-barrier also waits for unrelated pipeline P2P work.  Those source experiments
-were reverted; the repository source is clean and the fix is a launcher
-setting.
+The race was in `PPHandler.broadcast_drafts()`. `input_batch.idx_mapping` aliases the model runner's reusable GPU input buffer, but the gather `draft_tokens[input_batch.idx_mapping]` ran on the independent PP broadcast stream. Async scheduling could begin the next step and overwrite `idx_mapping` on the main stream while the broadcast stream was still reading it, producing out-of-range indices and terminating PP7. The fix performs the gather on the main stream first, then makes the broadcast stream wait for the main stream and broadcast the resulting private contiguous tensor. It adds no host or device-wide synchronization.
 
-The final settings retain all earlier requirements:
+Two defensive DSpark changes remain alongside the root fix: mixed prefill rows ignore stale `num_rejected` values and clamp decode rejection counts to the current query; MTP top-k compaction bounds its row indices. These prevent malformed stale metadata from escaping their buffers, but neither change alone fixed the rolling-load crash.
 
-- PP partition `13,11,10,11,11,11,8,3`.
-- `--max-num-batched-tokens 16384`, 30G BF16 KV budget, and
-  `FULL_DECODE_ONLY` CUDA Graphs.
-- Eight DSpark proposals and `enable_adaptive_verification=false`.
-- `--enable-auto-tool-choice --tool-call-parser glm47` and strict tool calling.
+Final production configuration restores async scheduling and `max-num-seqs=32`; `CUDA_LAUNCH_BLOCKING` is not set. The existing balanced `13,11,10,11,11,11,8,3` partition, 16,384-token batch budget, 30G BF16 KV allocation, `FULL_DECODE_ONLY`, eight DSpark proposals, disabled adaptive verification, and tool-call arguments are unchanged.
 
-All latency tests used 16 concurrent requests with approximately 4,354 input
-tokens per request.  Unique runs used distinct request prefixes.
+Validation after the PP stream fix:
 
-| Async blocking-wait workload | Output tokens/request | Mean TTFT | Mean TPOT | TPOT p95 | Output throughput |
-|---|---:|---:|---:|---:|---:|
-| Shared prefix | 128 | 7.63 s | 21.0 ms | 28.8 ms | 197.9 token/s |
-| Unique prefix | 128 | 10.87 s | 34.2 ms | 108.3 ms | 134.3 token/s |
-| Unique stress round 1 | 256 | 8.17 s | 25.0 ms | 51.6 ms | 279.0 token/s |
-| Unique stress round 2 | 256 | 8.16 s | 24.4 ms | 51.1 ms | 280.9 token/s |
-| Unique stress round 3 | 256 | 8.17 s | 24.8 ms | 51.1 ms | 281.0 token/s |
-| Unique long decode | 512 | 10.32 s | 23.8 ms | 40.8 ms | 317.7 token/s |
+| Test | Result |
+|---|---:|
+| Rolling mixed prompts, 120 clients, 384 output tokens each | 120/120 succeeded in 199.08 s |
+| Same test with global CUDA blocking (diagnostic only) | 120/120 succeeded in 486.68 s |
+| Server fatal CUDA/IndexKernel/EngineCore matches | 0 |
+| 16 requests, ~4,354 input tokens, 256 outputs: mean TPOT | 36.5 ms |
+| Same latency test: P95 TPOT / output throughput | 71.0 ms / 203.5 token/s |
+| Tool-call smoke | structured `get_weather({"city":"Beijing"})` |
 
-Thus the unique-prompt TPOT is comfortably below the requested 90 ms and is
-about 83% lower than the earlier 197 ms synchronous result.  After the full
-test sequence, DSpark metrics reported 13,498 accepted of 22,880 proposed
-tokens (59.0%, 4.72 accepted draft tokens per round).  Five consecutive unique
-stress/long-decode runs completed without `IndexKernel`, device assert, or
-engine-death errors.  A forced `get_weather` request returned HTTP 200 with a
-structured `{"city":"北京"}` tool call.
-
-Peak GPU 0-7 memory during the 16-request, 512-output run was 80,133, 83,407,
-76,241, 84,027, 83,407, 82,297, 77,527, and 86,953 MiB.  The 10,712 MiB spread
-is 7.5% of each 143,771 MiB GPU, while the last rank still carries the draft
-model and output head.  No layer repartition was needed.
-
-Evidence is in the same run directory: `perf-async-blockingwait-shared.json`,
-`perf-async-blockingwait-unique.json`,
-`perf-async-blockingwait-stress-{1,2,3}.json`,
-`perf-async-blockingwait-memory.json`, and
-`memory-async-blockingwait-load.csv`.
+Evidence: `rolling-mixed-pp-broadcast-fix.json`, `rolling-mixed-cuda-blocking.json`, `perf-pp-broadcast-fix.json`, `tool-smoke-pp-broadcast-fix.json`, and `logs/server-cuda-blocking-diagnostic-pass.log` in the run directory. The service remained healthy on port 8002 after all tests.

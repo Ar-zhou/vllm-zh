@@ -441,7 +441,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> None:
-        last_token_indices = self.last_token_indices[:num_reqs]
+        last_token_indices = self.last_token_indices[:num_reqs].clamp(
+            min=0, max=num_tokens - 1
+        )
         positions = self.input_buffers.positions[last_token_indices]
         # The output hidden state at position P (= positions) and the token id
         # at P+1 are used to draft the token at P+2. Sampling keys a draw by the
@@ -693,12 +695,16 @@ def _prepare_prefill_inputs_kernel(
     query_len = query_end - query_start
     seq_len = tl.load(seq_lens_ptr + req_idx)
 
-    # Get the true query length and next token after accounting for rejected tokens.
-    num_rejected = tl.load(num_rejected_ptr + req_idx)
-    query_len -= num_rejected
-
     num_sampled = tl.load(num_sampled_ptr + req_idx)
     if num_sampled > 0:
+        # Rejection counts are meaningful only for decode requests. Mixed
+        # prefill/decode batches may retain an old value in a prefill slot.
+        # Clamp defensively so last_token_index always stays in this query.
+        num_rejected = tl.load(num_rejected_ptr + req_idx)
+        num_rejected = tl.maximum(
+            0, tl.minimum(num_rejected, query_len - 1)
+        )
+        query_len -= num_rejected
         next_token = tl.load(last_sampled_ptr + req_state_idx).to(tl.int32)
     else:
         # Chunked prefilling.
