@@ -98,6 +98,39 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _get_pp_kv_cache_memory_bytes(pp_rank: int, pp_size: int) -> int | None:
+    partition = os.getenv("VLLM_PP_KV_CACHE_MEMORY_BYTES")
+    if partition is None:
+        return None
+
+    try:
+        values = [int(value.strip()) for value in partition.split(",")]
+    except ValueError as err:
+        raise ValueError(
+            "VLLM_PP_KV_CACHE_MEMORY_BYTES must be a comma-separated list "
+            "of byte counts"
+        ) from err
+
+    if len(values) != pp_size:
+        raise ValueError(
+            "VLLM_PP_KV_CACHE_MEMORY_BYTES must contain one value per "
+            f"pipeline stage, but got {len(values)} values for {pp_size} stages"
+        )
+    if any(value <= 0 for value in values):
+        raise ValueError(
+            "VLLM_PP_KV_CACHE_MEMORY_BYTES values must all be positive"
+        )
+
+    value = values[pp_rank]
+    logger.info(
+        "PP rank %d using %.2f GiB KV cache from "
+        "VLLM_PP_KV_CACHE_MEMORY_BYTES",
+        pp_rank,
+        value / GiB_bytes,
+    )
+    return value
+
+
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
     return (
@@ -424,6 +457,13 @@ class Worker(WorkerBase):
                 self.local_rank,
                 current_platform.dist_backend,
             )
+
+            pp_kv_cache_memory_bytes = _get_pp_kv_cache_memory_bytes(
+                get_pp_group().rank_in_group,
+                self.parallel_config.pipeline_parallel_size,
+            )
+            if pp_kv_cache_memory_bytes is not None:
+                self.cache_config.kv_cache_memory_bytes = pp_kv_cache_memory_bytes
 
             if self.use_v2_model_runner:
                 logger.info_once("Using V2 Model Runner")
