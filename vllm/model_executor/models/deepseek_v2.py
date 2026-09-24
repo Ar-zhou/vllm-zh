@@ -113,6 +113,7 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, SparseCacheRole
 
 from .interfaces import (
+    EagleModelMixin,
     MixtureOfExperts,
     SupportsEagle,
     SupportsEagle3,
@@ -1949,7 +1950,10 @@ class DeepseekV2ForCausalLM(
         self.extract_moe_parameters(example_moe)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.model.aux_hidden_state_layers = layers
+        if isinstance(self.model, EagleModelMixin):
+            self.model._set_aux_hidden_state_layers(layers)
+        else:
+            self.model.aux_hidden_state_layers = layers
 
     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
         num_layers = len(self.model.layers)
