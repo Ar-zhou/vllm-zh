@@ -35,7 +35,6 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     get_pp_missing_layer_names,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
@@ -230,12 +229,27 @@ class DeepseekV32Model(torch.nn.Module, EagleModelMixin):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
+        self.make_empty_intermediate_tensors = self._make_pp_intermediate_tensors
 
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+
+    def _make_pp_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        tensors = {
+            key: torch.zeros(
+                (batch_size, self.config.hidden_size), dtype=dtype, device=device
+            )
+            for key in ("hidden_states", "residual")
+        }
+        if get_pp_group().world_size > 1:
+            tensors["topk_indices"] = torch.empty(
+                (batch_size, self.config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -270,6 +284,14 @@ class DeepseekV32Model(torch.nn.Module, EagleModelMixin):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            # Sparse MLA reuses the previous scoring layer's top-k indices.
+            # A PP boundary may fall inside that reuse window, so restore the
+            # indices produced on the preceding stage before the first local
+            # layer consumes them.
+            if get_pp_group().world_size > 1:
+                self.topk_indices_buffer[: positions.shape[0]].copy_(
+                    intermediate_tensors["topk_indices"]
+                )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
@@ -313,6 +335,7 @@ class DeepseekV32Model(torch.nn.Module, EagleModelMixin):
                 {
                     "hidden_states": hidden_states,
                     "residual": residual,
+                    "topk_indices": self.topk_indices_buffer[:full_num_tokens],
                     **self.pack_local_aux_hidden_states(aux_hidden_states),
                 }
             )
