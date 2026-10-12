@@ -27,3 +27,6 @@ Verified on 2026-09-24: `/health` returned HTTP 200, `/v1/models` reported
 These checks do not establish acceptance rate, throughput, or long-context
 quality. Attach with `tmux attach -t glm52-v030-pp8-dspark-200k` and stop with
 Ctrl-C in that session.
+
+For the separate PP4 prefill + TP4 decode (1P1D) configuration, see
+[`examples/dspark_pp4_tp4_1p1d/README.md`](../../examples/dspark_pp4_tp4_1p1d/README.md).

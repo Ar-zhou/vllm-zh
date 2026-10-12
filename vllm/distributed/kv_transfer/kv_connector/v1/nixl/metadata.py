@@ -47,8 +47,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   9: Add block_strides
 #  10: Add dense virtual transfer pages for compressed MLA caches
 #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
+#  12: Give segmented regions unique names for PP stage matching
 #
-NIXL_CONNECTOR_VERSION: int = 11
+NIXL_CONNECTOR_VERSION: int = 12
 
 
 @dataclass
