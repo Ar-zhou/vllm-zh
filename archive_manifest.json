@@ -1,0 +1,231 @@
+{
+  "format": "tar+zstd split into 90 MiB Git blobs",
+  "datasets": [
+    {
+      "dataset": "openai-mrcr",
+      "bytes": 1181528264,
+      "sha256": "a34af96e48561c27b2b4d80439fa2e92210ea76eeb8ea2ba444a57c413d2f940",
+      "parts": [
+        {
+          "file": "openai-mrcr.tar.zst.part-000",
+          "bytes": 94371840,
+          "sha256": "38722519d9ef92cac694949d0055554180a751d172b79539d8a9e5436d2b160a"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-001",
+          "bytes": 94371840,
+          "sha256": "53470e201ab1804c104b4ba7e69db5971c115a71aac2d9bc7bca34fd8818e6fc"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-002",
+          "bytes": 94371840,
+          "sha256": "4f08d3d5c8a749f885d8058d2857cbdb2c410a4bcc6a8574832b88354ea3c045"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-003",
+          "bytes": 94371840,
+          "sha256": "43fc2d8c5afb84f842b3c189ec47e4302a4e4ec15e7d074667972ac81872e23d"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-004",
+          "bytes": 94371840,
+          "sha256": "dd6a261f9f87faca919a3808eac7e2be3a70d55cbeb99eebd680e68298040e03"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-005",
+          "bytes": 94371840,
+          "sha256": "021ab0e080a88f5fbb2dfa9a7a83a051d97572ccfaf05ca9de19dde3d02fc330"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-006",
+          "bytes": 94371840,
+          "sha256": "e24425893a0b854e3165e0a0c5531ab815b985f763fdfc4bd046f078fd43280f"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-007",
+          "bytes": 94371840,
+          "sha256": "7d123a15900e8db95bf7368de0d35b4f935834c4b7a26689dc9fe3a93b593fa5"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-008",
+          "bytes": 94371840,
+          "sha256": "68e8bce54c484f2a7ba998ea310c04cf9f3d6a1a871593bd1883f574f6c48cc2"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-009",
+          "bytes": 94371840,
+          "sha256": "9761ef3bdd80d0d386cf737fc59ebf39f4227e6438f4486d7762f65dba843818"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-010",
+          "bytes": 94371840,
+          "sha256": "70d101b9284cb4438ca82f1a5b170c267a1cd4f236d2058f0defcf3d0c833e25"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-011",
+          "bytes": 94371840,
+          "sha256": "9b6b9607b9df90dd4e72440beaa319318f13c24b820b827ceb2cf21be8b8f18c"
+        },
+        {
+          "file": "openai-mrcr.tar.zst.part-012",
+          "bytes": 49066184,
+          "sha256": "13650118bc435ceaab9cc7ef2515a32fb45085c3a522eb44db3d1c6432b6a373"
+        }
+      ]
+    },
+    {
+      "dataset": "glm53-length-sweep-v1",
+      "bytes": 1376847469,
+      "sha256": "c190e8df83fe5522c976a33e4df2b6c67182cbd24f969cf7f10d3c318e96f5f5",
+      "parts": [
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-000",
+          "bytes": 94371840,
+          "sha256": "002ba2903c8b31cf1fee5fe7799aa43167a2817dd7a84be5e79049a79ef4d6b3"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-001",
+          "bytes": 94371840,
+          "sha256": "37eb15af1e38091f0d818c9139f2864d67501b76d97f4f870049bf039dce069b"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-002",
+          "bytes": 94371840,
+          "sha256": "f702aaf7c3fc8ad5b0b74e982a059501cdebbd61b4447ecfa7fdbcb910a53d94"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-003",
+          "bytes": 94371840,
+          "sha256": "30cc2b0af05b5ce6410d99dd808896b11353845b7328d87b617e1f6f2c3a8228"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-004",
+          "bytes": 94371840,
+          "sha256": "588316c9f21b389f0324a9a80ad4ec82b9b346968b2f8d48c86dec0f57ef49ae"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-005",
+          "bytes": 94371840,
+          "sha256": "9fc577e6bcfa742f7ef797cbb2f0e8f520afce97db8737715980b60a772a6c7f"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-006",
+          "bytes": 94371840,
+          "sha256": "c0c74b55e457c9bf04080741f4bfa9261e15865b01dab1239d3b1ee2d4b90451"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-007",
+          "bytes": 94371840,
+          "sha256": "a558d7967c8754b4fafd8294146222777e1859ee92a07d2f49b1a42f78b08110"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-008",
+          "bytes": 94371840,
+          "sha256": "8b8264517a3c49a00f719dc1fd4930794bf89780ea41010cb01c11002907d899"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-009",
+          "bytes": 94371840,
+          "sha256": "27dd36e6d1e93a5dac9ea0cb9ffad59021cfdc03c2ac6b97229bee3f764ab240"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-010",
+          "bytes": 94371840,
+          "sha256": "dd839641813c1b258ead6c421f1f5afa123e4f65ad279e546e026a1c82952850"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-011",
+          "bytes": 94371840,
+          "sha256": "29401f8b853b0be0125966451bf78ff7ca7a1050bd8cb2afedbe3e5b6372cafa"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-012",
+          "bytes": 94371840,
+          "sha256": "879130d5ca68604b264dc65d66b639bd07e99b297c4deb57e89054da290c7300"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-013",
+          "bytes": 94371840,
+          "sha256": "024aab3eafdce19e7f6d9ea3a1e8c8ac80a6cfca736c9eeda7adf99e5ad1b2d8"
+        },
+        {
+          "file": "glm53-length-sweep-v1.tar.zst.part-014",
+          "bytes": 55641709,
+          "sha256": "55078d42d07973a587c6080c60a7f4a864d2d8e5d3d614d63dd09b8644e4a7e9"
+        }
+      ]
+    },
+    {
+      "dataset": "openai-mrcr-length-sweep-v1",
+      "bytes": 1149198999,
+      "sha256": "c04bffeb45b1f74309129000f9a6372c9e49fc6c475f873690cfe405921aecbd",
+      "parts": [
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-000",
+          "bytes": 94371840,
+          "sha256": "0fbe37a8ceb082b5633fa99041a180ba571a53511463ceef354dd59a4f942192"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-001",
+          "bytes": 94371840,
+          "sha256": "7273cf105399702e1c88e7d94194fef3d5d32ba19f51dfdaa20a051409f66285"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-002",
+          "bytes": 94371840,
+          "sha256": "eb006b52ec2518b5368cdc0d3e317449d35d812a5f1f5fad33c3c242b3288d01"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-003",
+          "bytes": 94371840,
+          "sha256": "60ba3f7f1a3a72896104f656f8d0a36b1735caa52f1b6bfe25b465aff7e1c635"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-004",
+          "bytes": 94371840,
+          "sha256": "4f0aa8957cd88524474a616b590d6790fbf2219904db73b296f6ac02441aceef"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-005",
+          "bytes": 94371840,
+          "sha256": "da2c36d763c7049bbd7d49b2c5b345be774247a31e334d40d9d4f3af41217f03"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-006",
+          "bytes": 94371840,
+          "sha256": "20dc991103c0629376d732f8b1e3c2f4263b849d0f209c36a1e443845496c331"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-007",
+          "bytes": 94371840,
+          "sha256": "8dede715e84f1db116ac6095837a13f064097ad764b4e8d4d7f92cceab0a9851"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-008",
+          "bytes": 94371840,
+          "sha256": "d755eb81648cade594a2c7d6fc6fc68cff473856d997683475f4178ebecd68ce"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-009",
+          "bytes": 94371840,
+          "sha256": "e799ee77e579f5d1921ba46a5fda99357e34392c8f51f5b41d9a002aeb55e842"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-010",
+          "bytes": 94371840,
+          "sha256": "c7cb5be118522c02d128e633f0b5da4994136dfccf7ecfec354671a11d776455"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-011",
+          "bytes": 94371840,
+          "sha256": "d93ad899ed2bdebe5fd9bd557b491dd32f0a29acbadc4f6c3fce4cc4df3c224c"
+        },
+        {
+          "file": "openai-mrcr-length-sweep-v1.tar.zst.part-012",
+          "bytes": 16736919,
+          "sha256": "f4a1d9b0676e43c841e7580dcf48e2b50bf64472c26bcd783286daa6cfeb001f"
+        }
+      ]
+    }
+  ]
+}
