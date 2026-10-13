@@ -11,6 +11,8 @@ EXAMPLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$EXAMPLE_DIR/../.." && pwd)"
 LOG_DIR="${LOG_DIR:-$REPO_ROOT/.runtime/logs/pd-pp4-tp4}"
 MODEL_NAME="${MODEL_NAME:-glm-5.2-dspark}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-bfloat16}"
+DRAFT_KV_CACHE_DTYPE="${DRAFT_KV_CACHE_DTYPE:-bfloat16}"
 FRONT_PORT="${FRONT_PORT:-8102}"
 P_PORT="${P_PORT:-8112}"
 D_PORT="${D_PORT:-8120}"
@@ -25,13 +27,13 @@ fi
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 "$VLLM_PYTHON" -c 'import vllm; assert vllm.__version__ == "0.30.0", vllm.__version__'
 
-SPEC_CONFIG="{\"model\":\"$DRAFT_PATH\",\"method\":\"dspark\",\"num_speculative_tokens\":8,\"draft_tensor_parallel_size\":1,\"draft_sample_method\":\"greedy\",\"attention_backend\":\"FLASH_ATTN\",\"kv_cache_dtype\":\"bfloat16\",\"enable_adaptive_verification\":false}"
+SPEC_CONFIG="{\"model\":\"$DRAFT_PATH\",\"method\":\"dspark\",\"num_speculative_tokens\":8,\"draft_tensor_parallel_size\":1,\"draft_sample_method\":\"greedy\",\"attention_backend\":\"FLASH_ATTN\",\"kv_cache_dtype\":\"$DRAFT_KV_CACHE_DTYPE\",\"enable_adaptive_verification\":false}"
 COMMON_ARGS=(
   serve "$MODEL_PATH" --host 0.0.0.0 --served-model-name "$MODEL_NAME"
   --trust-remote-code --safetensors-load-strategy lazy
   --enable-auto-tool-choice --tool-call-parser glm47
   --enable-prefix-caching --no-enable-expert-parallel
-  --max-model-len 200000 --kv-cache-dtype bfloat16 --block-size 64
+  --max-model-len 200000 --kv-cache-dtype "$KV_CACHE_DTYPE" --block-size 64
   --attention-backend FLASHMLA_SPARSE
   --compilation-config '{"mode":3,"cudagraph_mode":"FULL_DECODE_ONLY"}'
   --speculative-config "$SPEC_CONFIG"
