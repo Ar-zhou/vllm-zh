@@ -57,6 +57,7 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowSpec,
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
@@ -122,6 +123,16 @@ class Scheduler(SchedulerInterface):
 
         # Scheduling constraints.
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+        prefill_batches = vllm_config.swa_prefill_inflight_batches
+        self.swa_prefill_inflight_limit = (
+            prefill_batches * self.scheduler_config.max_num_batched_tokens
+            if prefill_batches is not None
+            and any(
+                isinstance(group.kv_cache_spec, SlidingWindowSpec)
+                for group in kv_cache_config.kv_cache_groups
+            )
+            else None
+        )
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -642,6 +653,17 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if request.spec_token_ids and request.num_computed_tokens >= (
+                request.num_tokens + request.num_output_placeholders
+            ):
+                # A PP stage can return draft tokens before the sampled token
+                # from the same in-flight step reaches the scheduler. There is
+                # no real input token to provide the extra verification logit
+                # yet. Wait for that output instead of scheduling draft-only
+                # rows, which the model runner cannot verify.
+                req_index += 1
+                continue
+
             if (
                 self.ec_connector is not None
                 and request.mm_features
@@ -663,6 +685,15 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            if self.swa_prefill_inflight_limit is not None and request.is_prefill_chunk:
+                num_new_tokens = min(
+                    num_new_tokens,
+                    max(
+                        0,
+                        self.swa_prefill_inflight_limit
+                        - request.num_in_flight_tokens,
+                    ),
+                )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.

@@ -605,9 +605,29 @@ class VllmConfig:
         # Recycling-aware KV cache specs (sliding-window, chunked-local) reserve
         # for this because out-of-window blocks are freed on the processed-token
         # basis, so in-flight steps transiently keep their blocks.
-        return (
-            self.max_concurrent_batches * self.scheduler_config.max_num_batched_tokens
-        )
+        prefill_batches = self.swa_prefill_inflight_batches
+        if prefill_batches is not None:
+            # The scheduler caps each request's in-flight prefill work at this
+            # many batches. Keep room for the decode steps that can still be
+            # in flight after the last prefill chunk has been scheduled.
+            return (
+                prefill_batches * self.scheduler_config.max_num_batched_tokens
+                + self.max_concurrent_batches * (self.num_speculative_tokens + 1)
+            )
+        return self.max_concurrent_batches * self.scheduler_config.max_num_batched_tokens
+
+    @property
+    def swa_prefill_inflight_batches(self) -> int | None:
+        value = os.environ.get("VLLM_SWA_PREFILL_INFLIGHT_BATCHES")
+        if value is None:
+            return None
+        batches = int(value)
+        if not 1 <= batches <= self.max_concurrent_batches:
+            raise ValueError(
+                "VLLM_SWA_PREFILL_INFLIGHT_BATCHES must be between 1 and "
+                f"{self.max_concurrent_batches}"
+            )
+        return batches
 
     @property
     def num_speculative_tokens(self) -> int:

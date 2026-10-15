@@ -168,6 +168,62 @@ def test_swa_admission_cap_accounts_for_overlapping_batches():
     assert overlapped == 193
 
 
+def test_swa_prefill_inflight_cap_matches_memory_reservation(monkeypatch):
+    monkeypatch.setenv("VLLM_SWA_PREFILL_INFLIGHT_BATCHES", "1")
+    scheduler = create_scheduler(
+        block_size=BLOCK_SIZE,
+        max_num_batched_tokens=32,
+        max_model_len=128,
+        pipeline_parallel_size=4,
+        kv_cache_spec=SlidingWindowSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=1,
+            head_size=1,
+            dtype=torch.float32,
+            sliding_window=SLIDING_WINDOW,
+        ),
+    )
+    assert scheduler.vllm_config.max_in_flight_tokens == 36
+    assert scheduler.swa_prefill_inflight_limit == 32
+
+    request = create_requests(num_requests=1, num_tokens=100)[0]
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[request.request_id] == 32
+    assert request.num_in_flight_tokens == 32
+
+    # The next PP step must wait for the same request's first prefill batch.
+    second = scheduler.schedule()
+    assert request.request_id not in second.num_scheduled_tokens
+    assert request.num_in_flight_tokens == 32
+
+    scheduler.update_from_output(first, _make_model_runner_output(first))
+    third = scheduler.schedule()
+    assert third.num_scheduled_tokens[request.request_id] == 32
+    assert request.num_in_flight_tokens == 32
+
+
+def test_pp_waits_for_sampled_token_before_verifying_drafts():
+    scheduler = create_scheduler(
+        block_size=BLOCK_SIZE,
+        max_num_batched_tokens=32,
+        max_model_len=128,
+        pipeline_parallel_size=4,
+        num_speculative_tokens=8,
+    )
+    request = create_requests(num_requests=1, num_tokens=8)[0]
+    scheduler.add_request(request)
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens[request.request_id] == 8
+
+    # Drafting may finish before the in-flight PP prefill returns its sample.
+    request.spec_token_ids = [1] * 8
+    assert request.num_computed_tokens == request.num_tokens
+    second = scheduler.schedule()
+    assert request.request_id not in second.num_scheduled_tokens
+    assert request.spec_token_ids == [1] * 8
+
+
 def test_chunked_local_free_waits_for_in_flight_step():
     """Chunked-local attention frees whole chunks left of the current one, and
     is exposed to the same load-WAR: with async scheduling those chunks must

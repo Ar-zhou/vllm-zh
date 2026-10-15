@@ -1608,6 +1608,20 @@ def _get_kv_cache_bytes_per_block(
     ]
     if hot_page_sizes:
         bytes_per_block = round_up(bytes_per_block, math.lcm(*hot_page_sizes))
+    if any(
+        isinstance(spec, MLAAttentionSpec)
+        for group in kv_cache_groups
+        for spec in iter_layer_specs(group.kv_cache_spec)
+    ):
+        # Sparse MLA indexes packed KV in whole content rows. A block-outermost
+        # pool must have a stride divisible by every attention row width.
+        row_widths = [
+            spec.state_content_size_bytes
+            for group in kv_cache_groups
+            for spec in iter_layer_specs(group.kv_cache_spec)
+            if isinstance(spec, AttentionSpec)
+        ]
+        bytes_per_block = round_up(bytes_per_block, math.lcm(*row_widths))
     return bytes_per_block
 
 
@@ -1764,6 +1778,8 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
+        if not group.layer_names:
+            continue
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
