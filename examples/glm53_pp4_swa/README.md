@@ -37,3 +37,21 @@ group-aware KV capacity (20.69 concurrent 200k-token requests). A
 150,004-token request completed without an OOM or draft-verification
 assertion. Capacity depends on the model weights, hardware, and available
 GPU memory.
+
+## PP-aware draft SWA grouping
+
+The packed KV grouping now caps a sliding-window group's width against the
+other KV groups **on each PP worker**. The original global grouping put all
+four draft SWA layers in one group. On PP3, that group required 1,048,576
+bytes per block, wider than the 967,680-byte target-plus-draft full-attention
+group. Sparse-MLA row alignment raised the physical block stride to
+1,385,472 bytes. Splitting the four SWA layers into two groups of two lowers
+the stride to 1,039,104 bytes. The groups still share one physical KV pool;
+each SWA group now allocates its own block IDs.
+
+On `192.168.31.35` GPU 0–3 at `--gpu-memory-utilization 0.91`, with the same
+partition and `--max-num-batched-tokens 32768`, the number of blocks increased
+from 82,188 to 109,584. Group-aware capacity for 200k requests increased
+from 4,477,690 to 5,197,249 tokens. A cold 199,005-token request completed
+in 49 seconds. The configured `--max-num-seqs 8` still limits live requests
+to eight, regardless of this theoretical KV capacity.
