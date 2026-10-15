@@ -636,6 +636,17 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                self.use_pp
+                and request.spec_token_ids
+                and request.num_computed_tokens
+                >= request.num_tokens + request.num_output_placeholders
+            ):
+                # The base token for speculative verification is still in flight
+                # through the pipeline. Wait for its output before scheduling drafts.
+                req_index += 1
+                continue
+
             if defer_prefills and request.is_prefill_chunk:
                 # DP prefill balancing: defer this in-progress prefill chunk to a
                 # cadence-aligned step; decodes still run to fill this step.
