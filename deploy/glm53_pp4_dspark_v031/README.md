@@ -4,7 +4,8 @@ This deployment runs on 192.168.31.35 with the vLLM 0.31.0 container image.
 The public router is `http://192.168.31.35:8110`; Prefill is PP4 on GPUs
 0–3 (`:8111`) with layer partition `22,20,20,16`, and Decode is DP4 on GPUs
 4–7 (`:8112`). Both roles use DSpark K=8, FP8 KV, Mooncake RoCE, and LMCache.
-The model name is `GLM-5.3-W4A4C8-MG43-BNT3-1P1D`; max context is 1,048,576.
+Both roles serve the model as `GLM-5.3-W4A4C8-MG43-BNT3-1P1D` and under the
+alias `glm-5.3-dspark` used by existing clients; max context is 1,048,576.
 
 Three source changes in this branch port the PP + DSpark fixes from
 `Ar-zhou/vllm-zh` branch `deploy/glm52-pp8-dspark-v030` (commits `c9c91f77a02d`

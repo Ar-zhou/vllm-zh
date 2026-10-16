@@ -63,7 +63,7 @@ exec ctr -n dspark-v41 run --rm --net-host "${gpu_flags[@]}" --device /dev/infin
   "${envs[@]}" "$image" "$name" \
   sh -c 'ulimit -l unlimited; ulimit -n 1048576; exec "$@"' sh \
   vllm serve "$model" --host 0.0.0.0 --port "$port" \
-  --served-model-name GLM-5.3-W4A4C8-MG43-BNT3-1P1D \
+  --served-model-name GLM-5.3-W4A4C8-MG43-BNT3-1P1D glm-5.3-dspark \
   "${parallel[@]}" --block-size 64 --max-model-len 1048576 \
   "${role_args[@]}" --enable-prefix-caching --kv-cache-dtype fp8 \
   --speculative-config "$spec" \
