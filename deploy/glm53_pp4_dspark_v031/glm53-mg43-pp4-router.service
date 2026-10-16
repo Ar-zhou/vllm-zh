@@ -1,0 +1,15 @@
+[Unit]
+Description=GLM-5.3 MG43 PP4 1P1D router on 8110
+After=glm53-mg43-pp4-p.service glm53-mg43-pp4-d.service network-online.target
+Wants=network-online.target
+Requires=glm53-mg43-pp4-p.service glm53-mg43-pp4-d.service
+
+[Service]
+Type=simple
+ExecStart=/mnt/paas/z00936200/glm53_mg43_pd_20261016/.venv/bin/vllm-router --host 0.0.0.0 --port 8110 --policy consistent_hash --vllm-pd-disaggregation --kv-connector mooncake --prefill http://127.0.0.1:8111 8999 --decode http://127.0.0.1:8112 --intra-node-data-parallel-size 1
+Restart=always
+RestartSec=20
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

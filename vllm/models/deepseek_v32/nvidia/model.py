@@ -30,11 +30,11 @@ from vllm.model_executor.models.deepseek_v2 import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
+from vllm.model_executor.models.interfaces import EagleModelMixin
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     get_pp_missing_layer_names,
     is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
     make_layers,
 )
 from vllm.models.common.ops.fused_allreduce_rms_norm import fused_allreduce_rms_norm
@@ -166,8 +166,9 @@ class DeepseekV32DecoderLayer(torch.nn.Module):
         return hidden_states, residual
 
 
-class DeepseekV32Model(torch.nn.Module):
+class DeepseekV32Model(torch.nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
+    supports_aux_hidden_states_over_pp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -228,12 +229,27 @@ class DeepseekV32Model(torch.nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
+        self.make_empty_intermediate_tensors = self._make_pp_intermediate_tensors
 
         self.aux_hidden_state_layers = tuple[int, ...]()
         self.num_redundant_experts = parallel_config.eplb_config.num_redundant_experts
+
+    def _make_pp_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        tensors = {
+            key: torch.zeros(
+                (batch_size, self.config.hidden_size), dtype=dtype, device=device
+            )
+            for key in ("hidden_states", "residual")
+        }
+        if get_pp_group().world_size > 1:
+            tensors["topk_indices"] = torch.empty(
+                (batch_size, self.config.index_topk),
+                dtype=torch.int32,
+                device=device,
+            )
+        return IntermediateTensors(tensors)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -268,6 +284,14 @@ class DeepseekV32Model(torch.nn.Module):
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
+            # Sparse MLA reuses the previous scoring layer's top-k indices.
+            # A PP boundary may fall inside that reuse window, so restore the
+            # indices produced on the preceding stage before the first local
+            # layer consumes them.
+            if get_pp_group().world_size > 1:
+                self.topk_indices_buffer[: positions.shape[0]].copy_(
+                    intermediate_tensors["topk_indices"]
+                )
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
@@ -281,24 +305,39 @@ class DeepseekV32Model(torch.nn.Module):
                 attn_in = sp_shard(attn_in)
             assert residual is None, "Currently, SP is not supported with PP"
 
+        aux_pp = get_pp_group().world_size > 1 and bool(self.aux_hidden_state_layers)
+        remote_aux_hidden_states = (
+            self.collect_remote_aux_hidden_states(intermediate_tensors)
+            if aux_pp
+            else []
+        )
         aux_hidden_states = []
+        if aux_pp and get_pp_group().is_first_rank and 0 in self.aux_hidden_state_layers:
+            aux_hidden_states.append(hidden_states)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            if idx in self.aux_hidden_state_layers:
+            if not aux_pp and idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(
                     hidden_states if residual is None else hidden_states + residual
                 )
             hidden_states, residual = layer(positions, hidden_states, residual, attn_in)
             attn_in = None
+            if aux_pp and idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_states.append(hidden_states + residual)
 
         if not get_pp_group().is_last_rank:
             assert not self.use_sequence_parallel, (
                 "Currently, SP is not supported with PP"
             )
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    "topk_indices": self.topk_indices_buffer[:full_num_tokens],
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
             )
 
         if self.use_sequence_parallel:
@@ -319,6 +358,8 @@ class DeepseekV32Model(torch.nn.Module):
             hidden_states, _ = fused_allreduce_rms_norm(
                 hidden_states, residual, self.norm
             )
+        if aux_pp:
+            aux_hidden_states = remote_aux_hidden_states + aux_hidden_states
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

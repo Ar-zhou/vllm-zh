@@ -122,6 +122,23 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         if hasattr(self._lmcache_engine, "register_kv_caches"):
             self._lmcache_engine.register_kv_caches(kv_caches)
+            # LMCache V3 discovers heterogeneous MLA, sparse-indexer and
+            # DSpark draft KV layouts from the registered tensors. Build its
+            # groups before the first store allocates host memory; otherwise
+            # it uses the legacy flat kv_shape, which omits indexer layers.
+            gpu_connector = self._lmcache_engine.lmcache_engine.gpu_connector
+            if gpu_connector is not None and hasattr(
+                gpu_connector, "_initialize_kv_cache_pointers"
+            ):
+                gpu_connector.initialize_kvcaches_ptr(
+                    kvcaches=list(kv_caches.values())
+                )
+                gpu_connector._initialize_kv_cache_pointers()
+                logger.info(
+                    "Registered %d KV caches in %d LMCache groups",
+                    len(kv_caches),
+                    gpu_connector.metadata.get_num_groups(),
+                )
         else:
             logger.warning(
                 "LMCache engine does not support register_kv_caches, "

@@ -1,0 +1,16 @@
+[Unit]
+Description=GLM-5.3 MG43 Prefill PP4 DSpark Mooncake LMCache
+After=containerd.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/mnt/paas/z00936200/glm53_mg43_pp4_dspark_v031/run_pd.sh p
+ExecStop=/mnt/paas/z00936200/glm53_mg43_pp4_dspark_v031/stop_pd.sh p
+Restart=always
+RestartSec=20
+TimeoutStopSec=50
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
