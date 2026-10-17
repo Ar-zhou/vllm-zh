@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import logging
+import os
 import queue
 import threading
 import time
@@ -965,6 +966,9 @@ class MooncakeConnectorWorker:
         # Tasks can await async events, so a surplus (2x is a robust heuristic)
         # prevents workers from idling.
         self.num_sender_tasks = self.num_sender_workers * 2
+        self._sender_diagnostics = os.getenv("VLLM_MOONCAKE_SENDER_DIAGNOSTICS") == "1"
+        self._sender_diag_active = 0
+        self._sender_tasks: list[asyncio.Task] = []
         protocol = kv_transfer_config.kv_connector_extra_config.get(  # type: ignore[union-attr]
             "mooncake_protocol", "rdma"
         )
@@ -1207,6 +1211,12 @@ class MooncakeConnectorWorker:
             asyncio.create_task(self._sender_worker(sock))
             for _ in range(self.num_sender_tasks)
         ]
+        self._sender_tasks = sender_tasks
+        diagnostic_task = (
+            asyncio.create_task(self._report_sender_state())
+            if self._sender_diagnostics
+            else None
+        )
 
         ready_event.set()
 
@@ -1220,15 +1230,37 @@ class MooncakeConnectorWorker:
             logger.error("Error in Mooncake sender thread: %s. Exiting thread.", str(e))
         finally:
             # Clean up worker tasks
+            if diagnostic_task is not None:
+                diagnostic_task.cancel()
+                await asyncio.gather(diagnostic_task, return_exceptions=True)
             for task in sender_tasks:
                 task.cancel()
             await asyncio.gather(*sender_tasks, return_exceptions=True)
             sock.close()
 
+    async def _report_sender_state(self) -> None:
+        while True:
+            await asyncio.sleep(10)
+            metas = tuple(self.reqs_need_send.values())
+            logger.info(
+                "Mooncake sender state: pp=%d pending=%d ready=%d "
+                "with_p_id=%d sending=%d queue=%d active=%d tasks_alive=%d/%d",
+                self.pp_rank,
+                len(metas),
+                sum(meta.ready.is_set() for meta in metas),
+                sum(bool(meta.p_req_id) for meta in metas),
+                sum(meta.sending > 0 for meta in metas),
+                self.sender_worker_queue.qsize(),
+                self._sender_diag_active,
+                sum(not task.done() for task in self._sender_tasks),
+                len(self._sender_tasks),
+            )
+
     async def _sender_worker(self, sock: zmq.asyncio.Socket):
         while True:
             try:
                 identity, metadata_bytes = await self.sender_worker_queue.get()
+                self._sender_diag_active += 1
                 try:
                     metadata = self._xfer_meta_decoder.decode(metadata_bytes)
                     await self.send_kv_to_decode(identity, sock, metadata)
@@ -1241,6 +1273,7 @@ class MooncakeConnectorWorker:
                         (identity, self._encoder.encode(error_response))
                     )
                 finally:
+                    self._sender_diag_active -= 1
                     self.sender_worker_queue.task_done()
             except asyncio.CancelledError:
                 break
@@ -1351,6 +1384,23 @@ class MooncakeConnectorWorker:
                 # Timeout, abort all pending requests.
                 for task in wait_tasks:
                     task.cancel()
+                if self._sender_diagnostics:
+                    logger.warning(
+                        "Mooncake P-ready timeout state: pp=%d queue=%d "
+                        "active=%d pending_sample=%s",
+                        self.pp_rank,
+                        self.sender_worker_queue.qsize(),
+                        self._sender_diag_active,
+                        [
+                            (
+                                req_id,
+                                bool(send_meta.p_req_id),
+                                send_meta.ready.is_set(),
+                                send_meta.sending,
+                            )
+                            for req_id, send_meta in list(pending_reqs.items())[:8]
+                        ],
+                    )
                 logger.warning(
                     "Timeout waiting for P side ready: %s", list(pending_reqs)
                 )
@@ -1857,7 +1907,6 @@ class MooncakeConnectorWorker:
 
         # Handle timeout to avoid stranding blocks on remote.
         now = time.perf_counter()
-
         expired_transfer_id = []
         for transfer_id, send_meta in self.reqs_need_send.items():
             if (

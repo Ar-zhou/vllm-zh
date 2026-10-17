@@ -31,11 +31,20 @@ It also binds each DP worker's transfer streams to the device that owns its KV
 tensors. `lmcache.yaml` disables LMCache's MLA default of saving only rank 0:
 each PP stage owns different layers and must save its own KV data.
 
-Prefill uses a fixed 48 GiB GPU KV allocation per stage and
+Prefill uses a fixed 76 GiB GPU KV allocation per stage and
 `max-num-batched-tokens=8192`. The original auto-sized cache left too little
 room for the sparse indexer's 36 GiB warmup workspace on the last PP rank.
-The observed resulting P capacity is 1,704,832 tokens; D capacity is
-1,570,816 tokens per replica.
+The previous 48 GiB allocation gave P capacity 1,704,832 tokens. With 76 GiB,
+the measured P capacity is 2,699,328 tokens and PP3 reached 245,590 MiB of
+275,040 MiB (89.3%) during startup warmup. PP3 is the memory-limiting rank;
+the same KV size is used on all PP ranks, so PP0-2 remain below 90%.
+Decode uses `max-num-batched-tokens=128` as in the requested reference config;
+its measured KV capacity is 1,629,312 tokens per replica. On the same 16-way,
+128-output-token sweep, aggregate throughput was 501 tok/s after this change,
+versus 1114 tok/s with D's previous 1024-token batch limit. The P KV size also
+changed between runs, so this is a comparison rather than an isolated D-side
+A/B measurement. Two short streams, two 11.5k-token LMCache requests, and
+the 16/32-way sweeps completed without request errors after the restart.
 
 The other `patches/` files are the compatibility overrides used by the previous
 working 0.31.0 TP/DP deployment: DP4 MoE scratch allocation and CUDA device
@@ -78,3 +87,16 @@ override it with `MAX_TOKENS=<n>`.
 The previous TP deployment remains on 35 as disabled systemd units
 `glm53-mg43-p`, `glm53-mg43-d`, and `glm53-mg43-router` and can be restarted
 after stopping the PP units. It uses ports 8000, 8010, and 8020.
+
+## Mooncake incident capture
+
+The P launcher accepts `GLM_MOONCAKE_DIAGNOSTICS=1`. With it, copy this
+branch's `vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py`
+to `source/mooncake_connector.py` on 35 before starting P. The launcher mounts
+that file and enables a 10-second sender-state log showing pending and ready
+transfers, sender queue depth, active transfers, and live tasks. The override
+also logs these counts on a P-ready timeout. D continues using the image file.
+
+Start `capture_incident.sh OUT_DIR` before reproducing a stall. It saves the
+complete P/D/router journal and polls health, key vLLM metrics, and GPU usage
+every 10 seconds. Run it on the deployment host and stop it with Ctrl-C.

@@ -27,13 +27,22 @@ patch_mounts=(
 if [[ "$role" == p ]]; then
   port=8111; gpus=0,1,2,3
   parallel=(--tensor-parallel-size 1 --pipeline-parallel-size 4 --distributed-executor-backend mp)
-  role_args=(--gpu-memory-utilization 0.90 --kv-cache-memory-bytes 48G --max-num-batched-tokens 8192 --safetensors-load-strategy lazy)
+  role_args=(--gpu-memory-utilization 0.90 --kv-cache-memory-bytes 76G --max-num-batched-tokens 8192 --safetensors-load-strategy lazy)
   envs=(--env VLLM_PP_LAYER_PARTITION=22,20,20,16 --env VLLM_MOONCAKE_BOOTSTRAP_PORT=8999)
+  if [[ "${GLM_MOONCAKE_DIAGNOSTICS:-0}" == 1 ]]; then
+    [[ -r "$base/source/mooncake_connector.py" ]] || {
+      echo "Missing $base/source/mooncake_connector.py" >&2; exit 1;
+    }
+    patch_mounts+=(
+      --mount "type=bind,src=$base/source/mooncake_connector.py,dst=/usr/local/lib/python3.12/dist-packages/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py,options=rbind:ro"
+    )
+    envs+=(--env VLLM_MOONCAKE_SENDER_DIAGNOSTICS=1)
+  fi
   kv='{"kv_connector":"MultiConnector","kv_role":"kv_producer","kv_connector_extra_config":{"connectors":['"$moon"',{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}]}}'
 elif [[ "$role" == d ]]; then
   port=8112; gpus=4,5,6,7
   parallel=(--tensor-parallel-size 1 --data-parallel-size 4 --data-parallel-backend mp --data-parallel-size-local 4 --enable-expert-parallel --distributed-executor-backend mp)
-  role_args=(--max-num-seqs 32 --max-num-batched-tokens 1024 --gpu-memory-utilization 0.94 --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}')
+  role_args=(--max-num-seqs 32 --max-num-batched-tokens 128 --gpu-memory-utilization 0.94 --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}')
   patch_mounts+=(
     --mount "type=bind,src=$base/patches/cutlass_moe_dpfix.py,dst=/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py,options=rbind:ro"
     --mount "type=bind,src=$base/patches/worker_utils_dpfix.py,dst=/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/utils.py,options=rbind:ro"
@@ -58,6 +67,7 @@ exec ctr -n dspark-v41 run --rm --net-host "${gpu_flags[@]}" --device /dev/infin
   --mount "type=bind,src=/mnt/paas/z00936200/glm53_mg43_pd_20261016,dst=/mnt/paas/z00936200/glm53_mg43_pd_20261016,options=rbind:ro" \
   --mount "type=bind,src=$base,dst=$base,options=rbind:rw" \
   --env VLLM_ENGINE_READY_TIMEOUT_S=3600 --env VLLM_HTTP_TIMEOUT_KEEP_ALIVE=75 \
+  --env VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT=60 \
   --env HF_HUB_OFFLINE=1 --env TRANSFORMERS_OFFLINE=1 --env PYTHONHASHSEED=0 \
   --env "LMCACHE_CONFIG_FILE=$base/lmcache.yaml" \
   "${envs[@]}" "$image" "$name" \

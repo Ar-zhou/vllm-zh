@@ -19,13 +19,14 @@ import urllib.request
 
 URL = "http://127.0.0.1:8110/v1/chat/completions"
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1024"))
+INPUT_REPETITIONS = int(os.environ.get("INPUT_REPETITIONS", "2300"))
 body = json.dumps(
     {
         "model": "GLM-5.3-W4A4C8-MG43-BNT3-1P1D",
         "messages": [
             {
                 "role": "user",
-                "content": ("alpha beta gamma delta. " * 2300)
+                "content": ("alpha beta gamma delta. " * INPUT_REPETITIONS)
                 + "\n请用一句话回答：1+1等于几？",
             }
         ],
