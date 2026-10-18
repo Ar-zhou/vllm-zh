@@ -168,9 +168,21 @@ def test_swa_admission_cap_accounts_for_overlapping_batches():
     assert overlapped == 193
 
 
-def test_swa_prefill_inflight_cap_matches_memory_reservation(monkeypatch):
+def _local_opt_config(tmp_path):
+    model_dir = tmp_path / "tiny-opt"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        '{"model_type":"opt","hidden_size":64,"num_hidden_layers":2,'
+        '"num_attention_heads":2,"ffn_dim":128,"vocab_size":1000,'
+        '"max_position_embeddings":128}'
+    )
+    return str(model_dir)
+
+
+def test_swa_prefill_inflight_cap_matches_memory_reservation(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_SWA_PREFILL_INFLIGHT_BATCHES", "1")
     scheduler = create_scheduler(
+        model=_local_opt_config(tmp_path),
         block_size=BLOCK_SIZE,
         max_num_batched_tokens=32,
         max_model_len=128,
@@ -203,8 +215,9 @@ def test_swa_prefill_inflight_cap_matches_memory_reservation(monkeypatch):
     assert request.num_in_flight_tokens == 32
 
 
-def test_pp_waits_for_sampled_token_before_verifying_drafts():
+def test_pp_waits_for_sampled_token_before_verifying_drafts(tmp_path):
     scheduler = create_scheduler(
+        model=_local_opt_config(tmp_path),
         block_size=BLOCK_SIZE,
         max_num_batched_tokens=32,
         max_model_len=128,

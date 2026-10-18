@@ -476,8 +476,10 @@ class TestSlidingWindowBucketCap:
             worker_specs[-1],
         )
 
-        assert _get_kv_cache_bytes_per_block(before) == 1_385_472
-        assert _get_kv_cache_bytes_per_block(after) == 1_039_104
+        # vLLM 0.31 expresses any required MLA row alignment on the cache
+        # specs themselves; these synthetic specs request no such alignment.
+        assert _get_kv_cache_bytes_per_block(before) == 1_048_576
+        assert _get_kv_cache_bytes_per_block(after) == 967_680
         assert [len(g.layer_names) for g in after] == [21, 2, 2]
 
     def test_sliding_window_bucket_is_capped_at_the_main_page(self):

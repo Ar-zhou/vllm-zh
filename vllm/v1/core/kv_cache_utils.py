@@ -2831,7 +2831,10 @@ def get_kv_cache_configs(
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
-    if vllm_config.cache_config.get_resolved_kv_cache_layout().is_block_outermost:
+    if (
+        vllm_config.parallel_config.pipeline_parallel_size > 1
+        and vllm_config.cache_config.get_resolved_kv_cache_layout().is_block_outermost
+    ):
         global_kv_cache_groups = _cap_pp_sliding_window_group_width(
             global_kv_cache_groups, kv_cache_specs
         )
