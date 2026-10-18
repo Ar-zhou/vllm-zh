@@ -1542,11 +1542,70 @@ def _replace_active_groups(
 
 
 _TP: GroupCoordinator | None = None
+_DRAFT_TP: GroupCoordinator | None = None
+_DRAFT_PP: GroupCoordinator | None = None
 
 
 def get_tp_group() -> GroupCoordinator:
     assert _TP is not None, "tensor model parallel group is not initialized"
     return _TP
+
+
+def get_draft_tp_group() -> GroupCoordinator:
+    """Return the experimental draft TP group sharing the PP ranks."""
+    assert _DRAFT_TP is not None, "draft tensor model parallel group is not initialized"
+    return _DRAFT_TP
+
+
+def initialize_draft_parallel_groups_from_pp() -> tuple[
+    GroupCoordinator, GroupCoordinator
+]:
+    """Create draft TP groups over target PP ranks and singleton draft PP groups.
+
+    This is a topology primitive for the experimental PP-target/TP-draft path.
+    Every world rank must call it in the same order after model-parallel groups
+    have been initialized. It does not alter the active target TP group.
+    """
+    global _DRAFT_TP, _DRAFT_PP
+    if _DRAFT_TP is not None and _DRAFT_PP is not None:
+        return _DRAFT_TP, _DRAFT_PP
+    assert _DRAFT_TP is None and _DRAFT_PP is None, "draft parallel groups are partially initialized"
+    pp_group = get_pp_group()
+    backend = torch.distributed.get_backend(pp_group.device_group)
+    local_rank = get_world_group().local_rank
+    _DRAFT_TP = init_model_parallel_group(
+        pp_group.group_ranks,
+        local_rank,
+        backend,
+        use_message_queue_broadcaster=True,
+        group_name="draft_tp",
+    )
+    world_size = get_world_group().world_size
+    _DRAFT_PP = init_model_parallel_group(
+        [[rank] for rank in range(world_size)],
+        local_rank,
+        backend,
+        group_name="draft_pp",
+    )
+    return _DRAFT_TP, _DRAFT_PP
+
+
+@contextmanager
+def use_draft_parallel_groups():
+    """Temporarily route model-parallel draft code through draft TP/PP groups.
+
+    The target uses its normal TP/PP coordinators outside this context. All
+    member ranks must enter and exit this context in the same order.
+    """
+    global _TP, _PP
+    target_tp, target_pp = _TP, _PP
+    _TP = get_draft_tp_group()
+    assert _DRAFT_PP is not None, "draft pipeline model parallel group is not initialized"
+    _PP = _DRAFT_PP
+    try:
+        yield
+    finally:
+        _TP, _PP = target_tp, target_pp
 
 
 _ETP: GroupCoordinator | None = None
@@ -2371,7 +2430,14 @@ def get_node_count() -> int:
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
-    global _TP, _ETP
+    global _TP, _ETP, _DRAFT_TP, _DRAFT_PP
+
+    if _DRAFT_TP:
+        _DRAFT_TP.destroy()
+    _DRAFT_TP = None
+    if _DRAFT_PP:
+        _DRAFT_PP.destroy()
+    _DRAFT_PP = None
 
     if _ETP and _ETP is not _TP:
         _ETP.destroy()

@@ -81,6 +81,23 @@ class DSparkSpeculator(DFlashSpeculator):
 
         self.use_confidence_head: bool = False
 
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        parallel = self.vllm_config.parallel_config
+        speculative = self.speculative_config
+        assert speculative is not None
+        uses_pp_draft_tp = (
+            parallel.pipeline_parallel_size > 1
+            and parallel.tensor_parallel_size == 1
+            and speculative.draft_tensor_parallel_size
+            == parallel.pipeline_parallel_size
+        )
+        if uses_pp_draft_tp:
+            # NCCL collectives across the PP ranks are part of DSpark sampling.
+            # Keep them out of CUDA graph capture until this communicator path
+            # has graph-capture support on every rank.
+            cudagraph_mode = CUDAGraphMode.NONE
+        super().init_cudagraph_manager(cudagraph_mode)
+
     def load_draft_model(
         self,
         target_model: torch.nn.Module,
@@ -163,7 +180,8 @@ class DSparkSpeculator(DFlashSpeculator):
         num_sample = num_reqs * n_spec
         # Per-(req, position) head hidden, ordered (req, step).
         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
-        # Draft-vocab logits; sampled ids are remapped to target vocab below.
+        # LogitsProcessor gathers vocab-parallel lm_head output in the active
+        # draft TP group, so these logits already span the full draft vocab.
         base_logits = self.model.compute_draft_logits(sample_hidden)
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)

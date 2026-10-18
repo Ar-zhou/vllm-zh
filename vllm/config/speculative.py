@@ -1545,6 +1545,11 @@ class SpeculativeConfig:
                         self.target_parallel_config,
                         self.draft_tensor_parallel_size,
                         self.draft_model_config.hf_config,
+                        allow_pp_draft_tp=(
+                            self.method == "dspark"
+                            and self.target_parallel_config.pipeline_parallel_size > 1
+                            and self.target_parallel_config.tensor_parallel_size == 1
+                        ),
                     )
                 )
                 self.draft_model_config.max_model_len = (
@@ -1707,6 +1712,7 @@ class SpeculativeConfig:
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int | None,
         draft_hf_config: PreTrainedConfig,
+        allow_pp_draft_tp: bool = False,
     ) -> int:
         """Verifies and adjusts the tensor parallel size for a draft model
         specified using speculative_draft_tensor_parallel_size.
@@ -1729,10 +1735,15 @@ class SpeculativeConfig:
         elif speculative_draft_tensor_parallel_size not in (
             1,
             target_parallel_config.tensor_parallel_size,
+        ) and not (
+            allow_pp_draft_tp
+            and speculative_draft_tensor_parallel_size
+            == target_parallel_config.pipeline_parallel_size
         ):
             raise ValueError(
-                f"{speculative_draft_tensor_parallel_size=} cannot be "
-                f"other value than 1 or target model tensor_parallel_size"
+                f"{speculative_draft_tensor_parallel_size=} must be 1, target "
+                "model tensor_parallel_size, or (for PP+DSpark) the target "
+                "pipeline_parallel_size"
             )
         return speculative_draft_tensor_parallel_size
 

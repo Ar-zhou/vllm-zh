@@ -115,7 +115,19 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     draft_inner = draft_model.model
     target_vocab_size = vllm_config.model_config.get_vocab_size()
 
-    if draft_model_config.get_vocab_size() <= target_vocab_size:
+    pp_spanning_draft_tp = (
+        vllm_config.parallel_config.pipeline_parallel_size > 1
+        and vllm_config.parallel_config.tensor_parallel_size == 1
+        and speculative_config.draft_parallel_config.tensor_parallel_size
+        == vllm_config.parallel_config.pipeline_parallel_size
+    )
+    # The target embedding and LM head live on different PP stages. A TP draft
+    # group spanning those stages must keep its own TP-sharded endpoints rather
+    # than replacing a single draft shard with an unsharded target module.
+    if (
+        not pp_spanning_draft_tp
+        and draft_model_config.get_vocab_size() <= target_vocab_size
+    ):
         maybe_share_target_embed(draft_model, draft_inner, target_inner)
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
@@ -125,7 +137,8 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         or draft_model_config.get_vocab_size()
     )
     if (
-        target_lm_head is not None
+        not pp_spanning_draft_tp
+        and target_lm_head is not None
         and draft_output_vocab_size == target_vocab_size
         and _should_share(draft_model, "has_own_lm_head", draft_lm_head, target_lm_head)
     ):

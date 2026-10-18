@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_draft_tp_group, get_pp_group
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import async_tensor_h2d
@@ -224,13 +224,50 @@ class PPHandler:
                     draft_tokens, src=self.last_rank, group=self.broadcast_group
                 )
             event = self.broadcast_stream.record_event()
-            num_sampled, num_rejected = combined.unbind(dim=0)
-            # Must record_stream since these were allocated on broadcast stream but
-            # later used on the main stream.
             sampled_tokens.record_stream(self.main_stream)
             combined.record_stream(self.main_stream)
             if draft_tokens is not None:
                 draft_tokens.record_stream(self.main_stream)
+        self.queue[-1] = PendingRecv(
+            event,
+            sampled_tokens,
+            *combined.unbind(dim=0),
+            input_batch.idx_mapping,
+            input_batch.idx_mapping_np,
+            need_sampled_mask,
+            gen_at_receive_np,
+            draft_tokens,
+        )
+        return True
+
+    def receive_for_draft_tp(
+        self, input_batch: InputBatch
+    ) -> tuple[bool, torch.Tensor, torch.Tensor]:
+        """Receive this step's sample counts without waiting for draft tokens."""
+        need_sampled_mask = compute_need_sampled_mask(input_batch)
+        num_reqs = input_batch.num_reqs
+        if need_sampled_mask is None:
+            zeros = torch.zeros(num_reqs, dtype=torch.int32, device=self.device)
+            return False, zeros, zeros.clone()
+
+        gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
+        with torch.cuda.stream(self.broadcast_stream):
+            self.broadcast_stream.wait_stream(self.main_stream)
+            sampled_tokens = torch.empty(
+                num_reqs, self.max_sample_len, dtype=torch.int64, device=self.device
+            )
+            combined = torch.empty(2, num_reqs, dtype=torch.int32, device=self.device)
+            torch.distributed.broadcast(
+                sampled_tokens, src=self.last_rank, group=self.broadcast_group
+            )
+            torch.distributed.broadcast(
+                combined, src=self.last_rank, group=self.broadcast_group
+            )
+            event = self.broadcast_stream.record_event()
+            sampled_tokens.record_stream(self.main_stream)
+            combined.record_stream(self.main_stream)
+        self.main_stream.wait_event(event)
+        num_sampled, num_rejected = combined.unbind(dim=0)
         self.queue[-1] = PendingRecv(
             event,
             sampled_tokens,
@@ -240,9 +277,53 @@ class PPHandler:
             input_batch.idx_mapping_np,
             need_sampled_mask,
             gen_at_receive_np,
-            draft_tokens,
+            None,
         )
-        return bool(need_sampled_mask.all())
+        return True, num_sampled, num_rejected
+
+    def broadcast_draft_context(
+        self,
+        hidden_states: torch.Tensor | None,
+        aux_hidden_states: list[torch.Tensor] | None,
+        dtype: torch.dtype,
+        synchronized_tensors: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Relay target hidden states to every rank in the draft TP group."""
+        group = get_draft_tp_group()
+        src = group.world_size - 1
+        for tensor in synchronized_tensors:
+            group.broadcast(tensor, src=src)
+        payload = None
+        if self.is_last_rank:
+            assert hidden_states is not None
+            payload = [hidden_states, *(aux_hidden_states or [])]
+
+        count = torch.zeros(1, dtype=torch.int32, device=self.device)
+        if payload is not None:
+            count[0] = len(payload)
+        group.broadcast(count, src=src)
+        n_tensors = int(count.item())
+        shapes = torch.zeros((n_tensors, 2), dtype=torch.int64, device=self.device)
+        if payload is not None:
+            for i, tensor in enumerate(payload):
+                if tensor.ndim != 2:
+                    raise ValueError(
+                        "PP draft TP currently expects 2D hidden-state tensors; "
+                        f"got shape {tuple(tensor.shape)}"
+                    )
+                shapes[i] = torch.tensor(tensor.shape, device=self.device)
+        group.broadcast(shapes, src=src)
+
+        received: list[torch.Tensor] = []
+        for i in range(n_tensors):
+            if payload is not None:
+                tensor = payload[i].contiguous()
+            else:
+                shape = tuple(int(x) for x in shapes[i].tolist())
+                tensor = torch.empty(shape, dtype=dtype, device=self.device)
+            group.broadcast(tensor, src=src)
+            received.append(tensor)
+        return received[0], received[1:] or None
 
     def broadcast(
         self,
