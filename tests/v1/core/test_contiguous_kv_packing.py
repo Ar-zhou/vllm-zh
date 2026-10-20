@@ -19,9 +19,11 @@ import torch
 from vllm.config import CacheConfig
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
+    _cap_pp_sliding_window_group_width,
     _get_kv_cache_bytes_per_block,
     _get_packed_kv_cache_groups,
     _pool_bytes_per_block,
+    _project_kv_cache_groups_to_worker,
     generate_scheduler_kv_cache_config,
     get_kv_cache_config_from_groups,
     get_kv_cache_groups,
@@ -37,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
     iter_layer_specs,
@@ -427,6 +430,58 @@ class TestCSALinearGrouping:
 
 
 class TestSlidingWindowBucketCap:
+    def test_pp_draft_swa_does_not_widen_last_stage(self):
+        """The draft is on PP3, where the main KV group is much narrower."""
+        full: dict[str, KVCacheSpec] = {
+            **{
+                f"target.attn.{i}": MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=656,
+                    dtype=torch.uint8,
+                )
+                for i in range(16)
+            },
+            **{
+                f"target.idx.{i}": MLAAttentionSpec(
+                    block_size=64,
+                    num_kv_heads=1,
+                    head_size=132,
+                    dtype=torch.uint8,
+                )
+                for i in range(4)
+            },
+            "draft.full": FullAttentionSpec(
+                block_size=64,
+                num_kv_heads=16,
+                head_size=128,
+                dtype=torch.uint8,
+            ),
+        }
+        swa: dict[str, KVCacheSpec] = {
+            f"draft.swa.{i}": SlidingWindowSpec(
+                block_size=64,
+                num_kv_heads=16,
+                head_size=128,
+                dtype=torch.uint8,
+                sliding_window=2048,
+            )
+            for i in range(4)
+        }
+        groups = [_uniform_group(full), _uniform_group(swa)]
+        worker_specs = [{}, {}, {}, {**full, **swa}]
+        before = _project_kv_cache_groups_to_worker(groups, worker_specs[-1])
+        after = _project_kv_cache_groups_to_worker(
+            _cap_pp_sliding_window_group_width(groups, worker_specs),
+            worker_specs[-1],
+        )
+
+        # vLLM 0.31 expresses any required MLA row alignment on the cache
+        # specs themselves; these synthetic specs request no such alignment.
+        assert _get_kv_cache_bytes_per_block(before) == 1_048_576
+        assert _get_kv_cache_bytes_per_block(after) == 967_680
+        assert [len(g.layer_names) for g in after] == [21, 2, 2]
+
     def test_sliding_window_bucket_is_capped_at_the_main_page(self):
         """DeepSeek-V4.1 shape: 43 SlidingWindowMLASpec SWA caches beside an
         unbalanced 8-layer paged MLA bucket. Left whole, the SWA bucket would

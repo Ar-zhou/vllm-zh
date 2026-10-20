@@ -1785,6 +1785,8 @@ def get_kv_cache_config_from_groups(
 
     kv_cache_tensors = []
     for group in kv_cache_groups:
+        if not group.layer_names:
+            continue
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
@@ -2681,6 +2683,98 @@ def _project_kv_cache_groups_to_worker(
     return projected_groups
 
 
+def _cap_pp_sliding_window_group_width(
+    groups: list[KVCacheGroupSpec],
+    worker_specs: list[dict[str, KVCacheSpec]],
+) -> list[KVCacheGroupSpec]:
+    """Keep a draft SWA group from widening a pipeline stage's packed pool.
+
+    Grouping is done over all layers before projecting to PP workers. A draft
+    with four SWA layers can fit beside the full model globally, yet exceed
+    the much smaller full-attention group on the final PP stage. Split only
+    when a worker's SWA pages exceed its other groups' page bytes.
+    """
+    # A non-PP decode worker must retain the same transfer group identities
+    # as the PP prefill workers. The deployment sets this to 2 for the four
+    # draft sliding-window layers; other runs keep the default PP-only behavior.
+    forced_split = int(os.environ.get("VLLM_SWA_PD_GROUP_SPLIT", "1"))
+    if len(worker_specs) < 2 and forced_split == 1:
+        return groups
+    if forced_split < 1:
+        raise ValueError("VLLM_SWA_PD_GROUP_SPLIT must be positive")
+
+    result: list[KVCacheGroupSpec] = []
+    for group in groups:
+        if not group.layer_names or not all(
+            isinstance(_get_per_layer_spec(group, name), SlidingWindowSpec)
+            for name in group.layer_names
+        ):
+            result.append(group)
+            continue
+
+        num_groups = forced_split if len(worker_specs) == 1 else 1
+        if len(worker_specs) == 1 and len(group.layer_names) != 4:
+            # Keep the override narrowly scoped to the DSpark draft SWA group.
+            num_groups = 1
+        for worker_spec in worker_specs:
+            local_names = [name for name in group.layer_names if name in worker_spec]
+            if len(local_names) < 2:
+                continue
+            anchor_bytes = max(
+                (
+                    sum(
+                        worker_spec[name].page_size_bytes
+                        for name in other.layer_names
+                        if name in worker_spec
+                    )
+                    for other in groups
+                    if other is not group
+                ),
+                default=0,
+            )
+            if not anchor_bytes:
+                continue
+            page_sizes = {worker_spec[name].page_size_bytes for name in local_names}
+            if len(page_sizes) != 1:
+                continue
+            page_size = next(iter(page_sizes))
+            layers_per_group = max(anchor_bytes // page_size, 1)
+            num_groups = max(num_groups, cdiv(len(local_names), layers_per_group))
+
+        if num_groups == 1:
+            result.append(group)
+            continue
+
+        split_names: list[list[str]] = [[] for _ in range(num_groups)]
+        assigned: set[str] = set()
+        for worker_spec in worker_specs:
+            local_names = [
+                name
+                for name in group.layer_names
+                if name in worker_spec and name not in assigned
+            ]
+            for i, name in enumerate(local_names):
+                split_names[i % num_groups].append(name)
+            assigned.update(local_names)
+        for names in split_names:
+            if not names:
+                continue
+            specs = {name: _get_per_layer_spec(group, name) for name in names}
+            group_spec = UniformTypeKVCacheSpecs.from_specs(specs)
+            assert group_spec is not None
+            result.append(
+                KVCacheGroupSpec(
+                    names, group_spec, is_eagle_group=group.is_eagle_group
+                )
+            )
+        logger.info(
+            "Split PP sliding-window KV group of %d layers into %d groups",
+            len(group.layer_names),
+            num_groups,
+        )
+    return result
+
+
 def get_kv_cache_configs(
     vllm_config: VllmConfig,
     kv_cache_specs: list[dict[str, KVCacheSpec]],
@@ -2746,6 +2840,14 @@ def get_kv_cache_configs(
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    if (
+        (vllm_config.parallel_config.pipeline_parallel_size > 1
+         or os.environ.get("VLLM_SWA_PD_GROUP_SPLIT") is not None)
+        and vllm_config.cache_config.get_resolved_kv_cache_layout().is_block_outermost
+    ):
+        global_kv_cache_groups = _cap_pp_sliding_window_group_width(
+            global_kv_cache_groups, kv_cache_specs
+        )
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.

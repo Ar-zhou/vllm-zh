@@ -239,6 +239,10 @@ class KVBlockZeroer:
             n_segs,
         ) = self._meta
         n_blocks = len(block_ids)
+        # Local DP ranks use different CUDA devices within this process group.
+        # Triton launches on the current device, so match the KV tensor device.
+        if self.device.index is not None:
+            torch.cuda.set_device(self.device.index)
         idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
         grid = (n_blocks, n_segs, max_chunks)
         _zero_kv_blocks_kernel[grid](
