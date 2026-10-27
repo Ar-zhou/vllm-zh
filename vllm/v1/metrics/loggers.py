@@ -1151,6 +1151,19 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_inter_token_latency[engine_idx].observe(itl)
 
         for finished_request in iteration_stats.finished_requests:
+            # Keep request-level timings out of Prometheus cardinality. The
+            # fixed-format log is joined with client-side SSE timing by ID.
+            if finished_request.request_id is not None:
+                logger.info(
+                    "REQUEST_TIMING request_id=%s queue_s=%.6f prefill_s=%.6f "
+                    "e2e_s=%.6f prompt_tokens=%d cached_tokens=%d",
+                    finished_request.request_id,
+                    finished_request.queued_time,
+                    finished_request.prefill_time,
+                    finished_request.e2e_latency,
+                    finished_request.num_prompt_tokens,
+                    finished_request.num_cached_tokens,
+                )
             self.counter_request_success[finished_request.finish_reason][
                 engine_idx
             ].inc()

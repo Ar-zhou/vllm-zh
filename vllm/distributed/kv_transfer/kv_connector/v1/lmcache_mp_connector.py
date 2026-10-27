@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorTransferResults,
 )
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -518,6 +519,7 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
 
         self.vllm_block_size = vllm_config.cache_config.block_size
+        self._multi_kv_groups = len(kv_cache_config.kv_cache_groups) > 1
 
     @property
     def role(self) -> KVConnectorRole:
@@ -684,6 +686,17 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
         return val
 
+    def get_transfer_results(
+        self, finished_req_ids: set[str]
+    ) -> KVConnectorTransferResults:
+        sending, recving = self.worker_adapter.get_finished(finished_req_ids)
+        failed = self.worker_adapter.get_failed_retrieve_req_ids()
+        return KVConnectorTransferResults(
+            finished_sending=set(sending or ()),
+            finished_recving=set(recving or ()),
+            failed_recving=failed,
+        )
+
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get the set of block IDs that failed to load.
 
@@ -702,7 +715,11 @@ class LMCacheMPConnectorUpstream(KVConnectorBase_V1):
               pass in which they are detected.
 
         """
-        return self.worker_adapter.get_block_ids_with_load_errors()
+        errors = self.worker_adapter.get_block_ids_with_load_errors()
+        # PP workers may see a single local KV group while the scheduler sees
+        # multiple global groups. Block IDs cannot be mapped safely in that
+        # case, so report failed request IDs through get_transfer_results.
+        return set()
 
     def shutdown(self):
         """Shutdown the connector. This is called when the worker process

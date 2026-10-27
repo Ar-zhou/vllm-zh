@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -355,6 +356,17 @@ class Scheduler(SchedulerInterface):
         self.prefill_capacity_bound = False
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
+        )
+        # Bound async external-KV admissions separately from max_num_seqs.
+        # Requests waiting for a remote KV load do not occupy a model-runner
+        # slot, yet each one reserves GPU blocks and submits transfer work.
+        self.max_inflight_async_kv_loads = max(
+            0, int(os.environ.get("VLLM_MAX_INFLIGHT_ASYNC_KV_LOADS", "0"))
+        )
+        self.queue_diag_enabled = os.environ.get("VLLM_P_QUEUE_DIAG") == "1"
+        self.next_queue_diag_time = 0.0
+        self.async_load_budget_bypass = (
+            os.environ.get("VLLM_P_ASYNC_LOAD_BUDGET_BYPASS") == "1"
         )
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
@@ -913,10 +925,30 @@ class Scheduler(SchedulerInterface):
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
 
-            while token_budget > 0:
+            # An asynchronous external-KV load schedules no model tokens. If
+            # another request has already filled this step's compute budget,
+            # use the same worker step to launch ready KV loads in parallel.
+            while token_budget > 0 or (
+                self.async_load_budget_bypass and bool(num_scheduled_tokens)
+            ):
                 # Requests holding KV blocks are always drained first.
                 request_queue = self.kv_holding_waiting or self.waiting
-                if not request_queue or input_budget <= draft_slots:
+                if not request_queue or (
+                    input_budget <= draft_slots
+                    and not (
+                        self.async_load_budget_bypass and bool(num_scheduled_tokens)
+                    )
+                ):
+                    break
+                if (
+                    request_queue is self.waiting
+                    and self.max_inflight_async_kv_loads
+                    and len(self._inflight_prefills)
+                    >= self.max_inflight_async_kv_loads
+                ):
+                    # The KV-holding queue was already drained above. Fresh
+                    # requests cannot start another remote load this step, so
+                    # leave them queued instead of scanning/deferring them all.
                     break
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
@@ -929,6 +961,17 @@ class Scheduler(SchedulerInterface):
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
                 if not ready_to_schedule:
+                    skip_request(request_queue)
+                    continue
+
+                if (
+                    self.max_inflight_async_kv_loads
+                    and request.num_computed_tokens == 0
+                    and len(self._inflight_prefills)
+                    >= self.max_inflight_async_kv_loads
+                ):
+                    # Defer before connector lookup, which can reserve L1
+                    # chunks. A deferred request owns no remote read locks.
                     skip_request(request_queue)
                     continue
 
@@ -1102,6 +1145,10 @@ class Scheduler(SchedulerInterface):
                     break
                 else:
                     request_token_budget = min(token_budget, input_budget - draft_slots)
+                    if request_token_budget <= 0:
+                        # The first request requiring compute cannot use this
+                        # step; preserve its position for the next step.
+                        break
                     if did_prefix_cache_lookup:
                         # Fresh admission: local and/or sync external hit.
                         num_replay_tokens = self._mark_prefix_replay(
@@ -2917,6 +2964,25 @@ class Scheduler(SchedulerInterface):
         )
         num_running, num_waiting = self.get_request_counts()
         num_deferred = len(self.deferred_waiting)
+        if self.queue_diag_enabled:
+            now = time.monotonic()
+            if now >= self.next_queue_diag_time:
+                self.next_queue_diag_time = now + 10.0
+                waiting_remote = sum(
+                    req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+                    for req in self.requests.values()
+                )
+                waiting_ordinary = sum(
+                    req.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED)
+                    for req in self.requests.values()
+                )
+                logger.info(
+                    "P_QUEUE_DIAG running=%d waiting=%d deferred=%d "
+                    "remote_kv=%d ordinary=%d inflight_prefills=%d kv_usage=%.4f",
+                    num_running, num_waiting, num_deferred, waiting_remote,
+                    waiting_ordinary, len(self._inflight_prefills),
+                    self.kv_cache_manager.usage,
+                )
         return SchedulerStats(
             num_running_reqs=num_running,
             num_waiting_reqs=num_waiting - num_deferred,
@@ -3176,8 +3242,15 @@ class Scheduler(SchedulerInterface):
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            req = self.requests[req_id]
+            req = self.requests.get(req_id)
+            if req is None:
+                # An aborted or already-freed request can receive a late
+                # asynchronous KV load completion.
+                logger.warning(
+                    "Ignoring late KV receive completion for removed request %s",
+                    req_id,
+                )
+                continue
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
@@ -3185,8 +3258,15 @@ class Scheduler(SchedulerInterface):
                 self._free_blocks(self.requests[req_id])
         for req_id in kv_connector_output.finished_sending or ():
             logger.debug("Finished sending KV transfer for request %s", req_id)
-            assert req_id in self.requests
-            self._free_blocks(self.requests[req_id])
+            request = self.requests.get(req_id)
+            if request is None:
+                # Another connector or an abort may have already released
+                # this request before its transfer completion arrives.
+                logger.warning(
+                    "Ignoring late KV send completion for removed request %s", req_id
+                )
+                continue
+            self._free_blocks(request)
 
     def _update_requests_with_invalid_blocks(
         self,
