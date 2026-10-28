@@ -44,6 +44,9 @@ def partial(
     E,
     H: tl.constexpr,
     BS: tl.constexpr,
+    ZS0: tl.constexpr,
+    ZS1: tl.constexpr,
+    ZS2: tl.constexpr,
     TS: tl.constexpr,
     CAUSAL: tl.constexpr,
     WINDOW: tl.constexpr,
@@ -82,7 +85,10 @@ def partial(
         ids = base + ks
         block = tl.load(T + req * TS + ids // BS, ids < hi, 0)
         z = tl.load(
-            Z + (block[:, None] * BS + ids[:, None] % BS) * 576 + dims[None, :],
+            Z
+            + block[:, None] * ZS0
+            + (ids[:, None] % BS) * ZS1
+            + dims[None, :] * ZS2,
             (ids[:, None] < hi) & (dims[None, :] < 576),
             0,
         )
@@ -131,7 +137,11 @@ def merge(OUT, E, Y, H: tl.constexpr, SPLITS: tl.constexpr):
 
 
 def attention(q, z, table, starts, lengths, causal, window):
-    assert q.is_contiguous() and z.is_contiguous() and q.shape[-1] == z.shape[-1] == 576
+    if not (q.is_contiguous() and q.shape[-1] == z.shape[-1] == 576):
+        raise ValueError(
+            f"Unsupported MLA layout: q_shape={tuple(q.shape)} q_stride={q.stride()} "
+            f"z_shape={tuple(z.shape)} z_stride={z.stride()}"
+        )
     tokens, heads, _ = q.shape
     splits = 16 if not window else 4
     tmp = torch.zeros(
@@ -151,6 +161,9 @@ def attention(q, z, table, starts, lengths, causal, window):
         lse,
         heads,
         z.shape[1],
+        z.stride(0),
+        z.stride(1),
+        z.stride(2),
         table.stride(0),
         causal,
         window or 0,
