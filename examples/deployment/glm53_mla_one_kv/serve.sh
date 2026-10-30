@@ -6,7 +6,7 @@ set -Eeuo pipefail
 mode=${1:?baseline, shared_first_N, or first_N_layers}
 port=${2:-8000}
 case "$mode" in
-  baseline|shared_first|first_layer|shared_first_[234]|first_[234]_layers) ;;
+  baseline|shared_first|first_layer|shared_first_[234]|first_[234]_layers|share_swa_[123]) ;;
   *) echo "Unknown mode: $mode" >&2; exit 2 ;;
 esac
 

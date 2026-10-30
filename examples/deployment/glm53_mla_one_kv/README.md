@@ -10,6 +10,7 @@ This experiment uses the GLM DSpark MLA implementation on vLLM v0.31.0. Set
 | `first_layer` | 1 | 1 |
 | `shared_first_N` (`N=2,3,4`) | N | 5 |
 | `first_N_layers` (`N=2,3,4`) | N | N |
+| `share_swa_N` (`N=1,2,3`) | 4 | 5 |
 
 In `shared_first_N`, later decoder layers keep their own queries, projections,
 feed-forward networks, and attention rules, but read layer N's latent KV. They
@@ -18,11 +19,17 @@ layers and the existing final norm and output heads. The `shared_first` and
 `first_layer` modes are the N=1 equivalents. The target model, speculative
 verification, and target KV are unchanged.
 
+In `share_swa_N`, sliding-window draft layer N reads the latent KV of layer
+N-1 and does not write its own cache. Every other layer keeps its own KV,
+including the final full-attention layer 4. All five draft decoder layers
+still execute. These modes isolate sharing one sliding-window layer without
+replacing the final full-attention cache.
+
 For a comparable serving experiment, use the same target and draft checkpoints,
 `num_speculative_tokens`, sampling settings, request bodies, concurrency, and
 generation limit for every mode. Disable prefix caching to remove cache-warmth
-effects. Check the engine's KV-cache log: the ablated modes should register one
-draft cache instead of five.
+effects. Check the engine's KV-cache log for the intended number of draft
+cache layers.
 
 Prometheus counters give the acceptance statistics:
 

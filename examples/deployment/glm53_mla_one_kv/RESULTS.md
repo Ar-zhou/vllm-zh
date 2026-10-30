@@ -56,3 +56,32 @@ At a fixed GPU memory utilization, vLLM assigns the freed HBM to a larger KV
 pool; total HBM usage therefore does not fall. Every mode still constructs and
 loads all five draft layers' weights in this experiment.
 Output correctness beyond successful generation was not scored here.
+
+## Sharing one sliding-window draft cache, retaining the full-attention cache
+
+The same 50 captured requests and serving settings were used for three more
+variants. `share_swa_N` makes sliding-window layer N read layer N-1's latent
+KV. The final full-attention layer 4 always has its own KV. All five draft
+layers run forward, and each variant allocates four draft KV layers.
+
+| Mode | Retained draft KV layers | KV capacity per DP rank | Accepted / proposed | Acceptance | Mean tokens per verify | Batch wall time |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline | 0,1,2,3,4 | 1,703,936 | 9,086 / 30,248 | 30.04% | 3.403 | 320.4 s |
+| Share layer 1 from 0 | 0,2,3,4 | 1,741,440 | 6,524 / 50,104 | 13.02% | 2.042 | 458.2 s |
+| Share layer 2 from 1 | 0,1,3,4 | 1,741,440 | 7,941 / 38,928 | 20.40% | 2.632 | 436.4 s |
+| Share layer 3 from 2 | 0,1,2,4 | 1,741,440 | 8,114 / 37,632 | 21.56% | 2.725 | 399.3 s |
+
+All 50 requests in each mode succeeded and returned 256 completion tokens.
+The best variant retained 71.8% of baseline acceptance while increasing
+schedulable KV capacity by 2.20%; its batch time was 24.6% longer. Batch
+times are directional because other experiments ran simultaneously on the
+other four GPUs. This is not a useful throughput tradeoff on this workload.
+
+One fewer BF16 MLA draft KV layer saves 576 * 2 = 1,152 bytes per token,
+or 1.125 GiB per 1,048,576-token prefix, *if* all five draft layers are
+otherwise stored in a host L1 cache. A host-L1 byte comparison was attempted
+with native LMCache MP and local connectors, but both trial deployments
+stalled during model cache initialization before registering/storing KV.
+Therefore the L1 saving is a layout calculation, not a measured result. The
+connector and cache-group configuration must be checked in the intended
+P/D deployment before claiming an actual L1 capacity improvement.

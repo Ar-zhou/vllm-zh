@@ -243,10 +243,26 @@ class GlmDSparkMLAModel(Qwen3DSparkModel):
         for count in range(2, num_layers):
             mode_layers[f"shared_first_{count}"] = (count, num_layers)
             mode_layers[f"first_{count}_layers"] = (count, count)
+        swa_share = {
+            f"share_swa_{layer_idx}": layer_idx
+            for layer_idx in range(1, num_layers - 1)
+        }
+        mode_layers.update({mode: (num_layers - 1, num_layers) for mode in swa_share})
         if self.kv_ablation not in mode_layers:
             raise ValueError(f"Unknown MLA KV ablation: {self.kv_ablation}")
         self.cache_layer_count, self.forward_layer_count = mode_layers[self.kv_ablation]
-        if self.cache_layer_count != num_layers:
+        self.cache_layer_indices = list(range(self.cache_layer_count))
+        if self.kv_ablation in swa_share:
+            shared_idx = swa_share[self.kv_ablation]
+            self.cache_layer_indices = [
+                i for i in range(num_layers) if i != shared_idx
+            ]
+            source = self.layers[shared_idx - 1].self_attn.attn.layer_name
+            attn = self.layers[shared_idx].self_attn
+            attn.attn.kv_sharing_target_layer_name = source
+            attn.kv_read_layer_name = source
+            attn.write_kv = False
+        elif self.cache_layer_count != num_layers:
             target_name = self.layers[
                 self.cache_layer_count - 1
             ].self_attn.attn.layer_name
@@ -258,10 +274,12 @@ class GlmDSparkMLAModel(Qwen3DSparkModel):
                 attn.kv_read_layer_name = target_name
                 attn.write_kv = False
         logger.info(
-            "GLM_DSPARK_MLA_KV_ABLATION mode=%s cache_layers=%d forward_layers=%d",
+            "GLM_DSPARK_MLA_KV_ABLATION mode=%s cache_layers=%d "
+            "forward_layers=%d retained_layers=%s",
             self.kv_ablation,
             self.cache_layer_count,
             self.forward_layer_count,
+            self.cache_layer_indices,
         )
 
     def forward(self, input_ids, positions, input_embeds=None):
@@ -283,9 +301,10 @@ class GlmDSparkMLAModel(Qwen3DSparkModel):
         context_states = rms(
             context_states, self.hidden_norm.weight, self.config.rms_norm_eps
         )
-        for i, layer in enumerate(self.layers[: self.cache_layer_count]):
+        for cache_idx, layer_idx in enumerate(self.cache_layer_indices):
+            layer = self.layers[layer_idx]
             slots = (
-                context_slot_mapping[i]
+                context_slot_mapping[cache_idx]
                 if isinstance(context_slot_mapping, (list, tuple))
                 else context_slot_mapping
             )
@@ -310,11 +329,11 @@ class GlmDSparkMLAForCausalLM(Qwen3DSparkForCausalLM):
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         names = super().get_draft_kv_cache_layer_names()
-        return names[: self.model.cache_layer_count]
+        return [names[i] for i in self.model.cache_layer_indices]
 
     def get_draft_attn_causal(self) -> list[bool]:
         causal = super().get_draft_attn_causal()
-        return causal[: self.model.cache_layer_count]
+        return [causal[i] for i in self.model.cache_layer_indices]
 
     def load_weights(self, weights):
         seen = set()
