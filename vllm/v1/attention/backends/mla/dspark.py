@@ -83,7 +83,7 @@ def partial(
     acc = tl.zeros((M, D), tl.float32)
     for base in range(lo, hi, N):
         ids = base + ks
-        block = tl.load(T + req * TS + ids // BS, ids < hi, 0)
+        block = tl.load(T + req * TS + ids // BS, ids < hi, 0).to(tl.int64)
         z = tl.load(
             Z
             + block[:, None] * ZS0
