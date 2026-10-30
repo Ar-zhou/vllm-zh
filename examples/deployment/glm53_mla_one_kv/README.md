@@ -8,12 +8,15 @@ This experiment uses the GLM DSpark MLA implementation on vLLM v0.31.0. Set
 | `baseline` | 5 | 5 |
 | `shared_first` | 1 | 5 |
 | `first_layer` | 1 | 1 |
+| `shared_first_N` (`N=2,3,4`) | N | 5 |
+| `first_N_layers` (`N=2,3,4`) | N | N |
 
-In `shared_first`, later decoder layers keep their own queries, projections,
-feed-forward networks, and attention rules, but read the first layer's latent
-KV. They do not write KV. In `first_layer`, the draft executes the first
-decoder layer and the existing final norm and output heads. The target model,
-speculative verification, and target KV are unchanged.
+In `shared_first_N`, later decoder layers keep their own queries, projections,
+feed-forward networks, and attention rules, but read layer N's latent KV. They
+do not write KV. In `first_N_layers`, the draft executes the first N decoder
+layers and the existing final norm and output heads. The `shared_first` and
+`first_layer` modes are the N=1 equivalents. The target model, speculative
+verification, and target KV are unchanged.
 
 For a comparable serving experiment, use the same target and draft checkpoints,
 `num_speculative_tokens`, sampling settings, request bodies, concurrency, and

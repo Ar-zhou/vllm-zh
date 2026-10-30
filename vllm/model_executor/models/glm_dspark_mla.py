@@ -234,32 +234,46 @@ class GlmDSparkMLAModel(Qwen3DSparkModel):
             prefix=prefix,
         )
         self.kv_ablation = os.getenv("VLLM_DSPARK_MLA_KV_ABLATION", "baseline")
-        if self.kv_ablation not in {"baseline", "shared_first", "first_layer"}:
+        num_layers = len(self.layers)
+        mode_layers = {
+            "baseline": (num_layers, num_layers),
+            "shared_first": (1, num_layers),
+            "first_layer": (1, 1),
+        }
+        for count in range(2, num_layers):
+            mode_layers[f"shared_first_{count}"] = (count, num_layers)
+            mode_layers[f"first_{count}_layers"] = (count, count)
+        if self.kv_ablation not in mode_layers:
             raise ValueError(f"Unknown MLA KV ablation: {self.kv_ablation}")
-        if self.kv_ablation != "baseline":
-            first_name = self.layers[0].self_attn.attn.layer_name
-            for layer in self.layers[1:]:
+        self.cache_layer_count, self.forward_layer_count = mode_layers[self.kv_ablation]
+        if self.cache_layer_count != num_layers:
+            target_name = self.layers[
+                self.cache_layer_count - 1
+            ].self_attn.attn.layer_name
+            for layer in self.layers[self.cache_layer_count :]:
                 attn = layer.self_attn
                 # The attention registry skips KV allocation for sharing layers.
                 # Each layer still owns its own projections and decoder weights.
-                attn.attn.kv_sharing_target_layer_name = first_name
-                attn.kv_read_layer_name = first_name
+                attn.attn.kv_sharing_target_layer_name = target_name
+                attn.kv_read_layer_name = target_name
                 attn.write_kv = False
         logger.info(
             "GLM_DSPARK_MLA_KV_ABLATION mode=%s cache_layers=%d forward_layers=%d",
             self.kv_ablation,
-            5 if self.kv_ablation == "baseline" else 1,
-            1 if self.kv_ablation == "first_layer" else len(self.layers),
+            self.cache_layer_count,
+            self.forward_layer_count,
         )
 
     def forward(self, input_ids, positions, input_embeds=None):
-        if self.kv_ablation != "first_layer":
+        if self.forward_layer_count == len(self.layers):
             return super().forward(input_ids, positions, input_embeds)
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
-        hidden_states, residual = self.layers[0](
-            positions=positions, hidden_states=input_embeds, residual=None
-        )
+        hidden_states, residual = input_embeds, None
+        for layer in self.layers[: self.forward_layer_count]:
+            hidden_states, residual = layer(
+                positions=positions, hidden_states=hidden_states, residual=residual
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -269,8 +283,7 @@ class GlmDSparkMLAModel(Qwen3DSparkModel):
         context_states = rms(
             context_states, self.hidden_norm.weight, self.config.rms_norm_eps
         )
-        layers = self.layers if self.kv_ablation == "baseline" else self.layers[:1]
-        for i, layer in enumerate(layers):
+        for i, layer in enumerate(self.layers[: self.cache_layer_count]):
             slots = (
                 context_slot_mapping[i]
                 if isinstance(context_slot_mapping, (list, tuple))
@@ -297,11 +310,11 @@ class GlmDSparkMLAForCausalLM(Qwen3DSparkForCausalLM):
 
     def get_draft_kv_cache_layer_names(self) -> list[str]:
         names = super().get_draft_kv_cache_layer_names()
-        return names if self.model.kv_ablation == "baseline" else names[:1]
+        return names[: self.model.cache_layer_count]
 
     def get_draft_attn_causal(self) -> list[bool]:
         causal = super().get_draft_attn_causal()
-        return causal if self.model.kv_ablation == "baseline" else causal[:1]
+        return causal[: self.model.cache_layer_count]
 
     def load_weights(self, weights):
         seen = set()

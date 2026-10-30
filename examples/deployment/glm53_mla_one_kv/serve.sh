@@ -3,10 +3,10 @@ set -Eeuo pipefail
 
 : "${MODEL_PATH:?Set MODEL_PATH to the target checkpoint}"
 : "${DRAFT_PATH:?Set DRAFT_PATH to the MLA draft checkpoint}"
-mode=${1:?baseline, shared_first, or first_layer}
+mode=${1:?baseline, shared_first_N, or first_N_layers}
 port=${2:-8000}
 case "$mode" in
-  baseline|shared_first|first_layer) ;;
+  baseline|shared_first|first_layer|shared_first_[234]|first_[234]_layers) ;;
   *) echo "Unknown mode: $mode" >&2; exit 2 ;;
 esac
 
