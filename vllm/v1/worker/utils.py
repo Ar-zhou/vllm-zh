@@ -239,15 +239,16 @@ class KVBlockZeroer:
             n_segs,
         ) = self._meta
         n_blocks = len(block_ids)
-        idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
-        grid = (n_blocks, n_segs, max_chunks)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            seg_block_strides,
-            seg_page_sizes,
-            idx,
-            BLOCK_SIZE=blk_size,
-        )
+        with torch.cuda.device(self.device):
+            idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+            grid = (n_blocks, n_segs, max_chunks)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                seg_block_strides,
+                seg_page_sizes,
+                idx,
+                BLOCK_SIZE=blk_size,
+            )
 
     def warmup(self, num_kv_blocks: int) -> None:
         """JIT-compile the zeroing kernel before the first real request."""

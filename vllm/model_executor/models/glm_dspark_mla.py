@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM DSpark with compressed MLA caches and per-layer block attention."""
 
+import os
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -79,6 +81,8 @@ class GlmDSparkMLAAttention(nn.Module):
         if dimensions != (2048, 512, 192, 64, 256):
             raise ValueError(f"Unsupported GLM DSpark MLA dimensions: {dimensions}")
         self.layer_name = prefix
+        self.kv_read_layer_name = prefix + ".attn"
+        self.write_kv = True
         self.num_heads = (
             config.num_attention_heads // get_tensor_model_parallel_world_size()
         )
@@ -153,11 +157,16 @@ class GlmDSparkMLAAttention(nn.Module):
         if metadata is None:
             return torch.zeros_like(hidden_states)
         metadata = (
-            metadata[self.attn.layer_name] if isinstance(metadata, dict) else metadata
+            metadata[self.kv_read_layer_name] if isinstance(metadata, dict) else metadata
         )
         if metadata is None:
             return torch.zeros_like(hidden_states)
-        self.store(hidden_states, positions, context.slot_mapping[self.attn.layer_name])
+        if self.write_kv:
+            self.store(
+                hidden_states,
+                positions,
+                context.slot_mapping[self.attn.layer_name],
+            )
         q = F.linear(
             self.q_a_layernorm(self.q_a_proj(hidden_states)), self.q_b_proj.weight
         )
@@ -218,13 +227,50 @@ class GlmDSparkDecoderLayer(DFlashQwen3DecoderLayer):
 class GlmDSparkMLAModel(Qwen3DSparkModel):
     decoder_layer_cls = GlmDSparkDecoderLayer
 
+    def __init__(self, *, vllm_config, start_layer_id=0, prefix=""):
+        super().__init__(
+            vllm_config=vllm_config,
+            start_layer_id=start_layer_id,
+            prefix=prefix,
+        )
+        self.kv_ablation = os.getenv("VLLM_DSPARK_MLA_KV_ABLATION", "baseline")
+        if self.kv_ablation not in {"baseline", "shared_first", "first_layer"}:
+            raise ValueError(f"Unknown MLA KV ablation: {self.kv_ablation}")
+        if self.kv_ablation != "baseline":
+            first_name = self.layers[0].self_attn.attn.layer_name
+            for layer in self.layers[1:]:
+                attn = layer.self_attn
+                # The attention registry skips KV allocation for sharing layers.
+                # Each layer still owns its own projections and decoder weights.
+                attn.attn.kv_sharing_target_layer_name = first_name
+                attn.kv_read_layer_name = first_name
+                attn.write_kv = False
+        logger.info(
+            "GLM_DSPARK_MLA_KV_ABLATION mode=%s cache_layers=%d forward_layers=%d",
+            self.kv_ablation,
+            5 if self.kv_ablation == "baseline" else 1,
+            1 if self.kv_ablation == "first_layer" else len(self.layers),
+        )
+
+    def forward(self, input_ids, positions, input_embeds=None):
+        if self.kv_ablation != "first_layer":
+            return super().forward(input_ids, positions, input_embeds)
+        if input_embeds is None:
+            input_embeds = self.embed_input_ids(input_ids)
+        hidden_states, residual = self.layers[0](
+            positions=positions, hidden_states=input_embeds, residual=None
+        )
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+
     def precompute_and_store_context_kv(
         self, context_states, context_positions, context_slot_mapping=None
     ):
         context_states = rms(
             context_states, self.hidden_norm.weight, self.config.rms_norm_eps
         )
-        for i, layer in enumerate(self.layers):
+        layers = self.layers if self.kv_ablation == "baseline" else self.layers[:1]
+        for i, layer in enumerate(layers):
             slots = (
                 context_slot_mapping[i]
                 if isinstance(context_slot_mapping, (list, tuple))
@@ -248,6 +294,14 @@ class GlmDSparkMLAForCausalLM(Qwen3DSparkForCausalLM):
         if not vllm_config.model_config.enforce_eager:
             raise ValueError("GLM MLA DSpark currently requires --enforce-eager")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+    def get_draft_kv_cache_layer_names(self) -> list[str]:
+        names = super().get_draft_kv_cache_layer_names()
+        return names if self.model.kv_ablation == "baseline" else names[:1]
+
+    def get_draft_attn_causal(self) -> list[bool]:
+        causal = super().get_draft_attn_causal()
+        return causal if self.model.kv_ablation == "baseline" else causal[:1]
 
     def load_weights(self, weights):
         seen = set()
