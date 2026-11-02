@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# P is launched with the reduced-cache experiment; D is explicitly baseline.
-# This is intentional: D must materialize every draft layer's KV for each
-# generated token. P's reduced draft cache cannot be treated as D's complete
-# cache without an explicit reconstruction/transfer step.
+# Both P and D use the same approximate four-cache layout. Layer 5 still
+# executes, but reads layer 4's KV and does not register/write a fifth cache.
+# Keeping the layouts identical makes Mooncake/LMCache metadata compatible.
 role=${1:?p or d}
 base=/mnt/paas/z00936200/glm53_pd_swa_lmcache_v031
 mla_base=/mnt/paas/z00936200/glm53_mla_pd_v031
@@ -74,7 +73,7 @@ elif [[ "$role" == d ]]; then
     --mount "type=bind,src=$base/patches/cutlass_moe_dpfix.py,dst=/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/cutlass_moe.py,options=rbind:ro"
     --mount "type=bind,src=$base/patches/worker_utils_dpfix.py,dst=/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/utils.py,options=rbind:ro"
   )
-  envs=(--env VLLM_DSPARK_MLA_KV_ABLATION=baseline --env VLLM_KV_CACHE_LAYOUT=BLHNC --env VLLM_SWA_PD_GROUP_SPLIT=3 --env VLLM_MAX_INFLIGHT_ASYNC_KV_LOADS=16)
+  envs=(--env VLLM_DSPARK_MLA_KV_ABLATION=shared_first_4 --env VLLM_KV_CACHE_LAYOUT=BLHNC --env VLLM_SWA_PD_GROUP_SPLIT=3 --env VLLM_MAX_INFLIGHT_ASYNC_KV_LOADS=16)
   moon=${moon/kv_producer/kv_consumer}
 else
   exit 2

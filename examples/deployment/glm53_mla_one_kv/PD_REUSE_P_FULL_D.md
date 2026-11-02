@@ -9,14 +9,10 @@ This launcher separates the two cache semantics:
   and creates/writes all five draft KV tensors, including the KV for every new
   generated token.
 
-This is not equivalent to simply starting the existing P/D service with two
-different environment values. The P and D draft KV group layouts differ (P has
-four groups, D has five). Mooncake/LMCache transfer metadata must therefore
-either transfer only the target-model KV and let D rebuild the draft prompt KV,
-or carry an explicit P-to-D reconstruction payload. Sending P's four-group
-draft cache directly into D's five-group cache is invalid.
-
-`run_pd_p_reuse_d_full.sh` sets the two environment values explicitly, but a
-deployment must also use a connector path that excludes the reduced P draft
-groups from the P/D transfer. The script is a configuration scaffold until
-that metadata path is implemented and tested.
+An approximate alternative is now supported by the launcher: both P and D use
+`shared_first_4`. Their draft KV group layouts are identical (four groups), so
+the existing Mooncake/LMCache metadata path remains usable. D no longer
+reconstructs an independent fifth-layer KV; this is an intentional accuracy
+tradeoff. The previous P-reduced/D-full arrangement would require an explicit
+reconstruction or a different transfer protocol and is not used by this
+launcher.
